@@ -2,7 +2,6 @@
 //! would reproduce the same light events. Nothing is written to disk.
 
 use crate::audio::Song;
-use crate::eval;
 use crate::map;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -22,6 +21,8 @@ struct Report {
     formats: BTreeMap<&'static str, usize>,
     custom_objects: usize,
     maps_with_geometry: usize,
+    with_env: usize,
+    no_env: BTreeMap<String, usize>,
 }
 
 /// Canonical text form of an event: sorted keys, numbers rounded, v3 defaults filled in.
@@ -46,7 +47,7 @@ fn canonical(v: &Value) -> String {
         let defaults = if v2 {
             [("_time", 0.0), ("_type", 0.0), ("_value", 0.0), ("_floatValue", 1.0)]
         } else {
-            [("b", 0.0), ("et", 0.0), ("i", 0.0), ("f", 1.0)]
+            [("b", 0.0), ("et", 0.0), ("i", 0.0), ("f", 0.0)]
         };
         for (k, d) in defaults {
             o.entry(k).or_insert(serde_json::json!(d));
@@ -112,34 +113,29 @@ fn check_map(folder: &Path, decode_audio: bool, report: &Mutex<Report>) {
             .filter_map(|r| r.keys.last())
             .map(|k| k.beat)
             .fold(0.0, f64::max);
+        let env = crate::environment::EnvFile::load(&d.environment);
+        let model = crate::cmlight::LightModel::build(&bm, env.as_ref(), &d.colors, info.bpm);
         for row in &bm.rows {
             let mut b = 0.0;
             while b <= end + 1.0 {
-                let c = eval::row_color(row, b, 2.0);
+                let c = model.row_rgb(row, b);
                 assert!(c.iter().all(|v| v.is_finite()), "non-finite color in {name}");
                 b += 0.37;
             }
         }
-
         let lanes = crate::preview::build(&bm.rows);
-        let mut b = 0.0;
-        while b <= end + 1.0 {
-            for l in &lanes {
-                let cols = crate::preview::lane_colors(&bm.rows, l, b, 2.0, 4);
-                assert!(cols.iter().flatten().all(|v| v.is_finite()), "bad preview color in {name}");
-            }
-            b += 1.7;
-        }
-
         let scene = crate::scene::Scene::parse(&bm.json);
         let base = crate::view3d::base_stage(&lanes, &bm.rows, &scene);
         let objs: Vec<(&crate::scene::Obj, &crate::scene::Scene)> =
             base.iter().chain(&scene.objects).map(|o| (o, &scene)).collect();
         for beat in [0.0, end * 0.25, end * 0.5, end] {
-            let light = |lane: i64, id: Option<i64>| {
-                crate::preview::light_rgb(&bm.rows, &lanes, lane, id, beat, 2.0)
-            };
-            crate::view3d::triangle_count(&objs, beat, &light);
+            let light = |lane: i64, ids: &[i64]| model.rgb_keys(lane, ids, beat);
+            crate::view3d::triangle_count(&objs, env.as_ref(), beat, &light);
+        }
+        if env.is_some() {
+            report.lock().unwrap().with_env += 1;
+        } else {
+            *report.lock().unwrap().no_env.entry(d.environment.clone()).or_default() += 1;
         }
         {
             let mut r = report.lock().unwrap();
@@ -234,6 +230,10 @@ pub fn run(dir: &Path, decode_audio: bool) -> i32 {
     println!(
         "3D preview: {} difficulties with custom geometry, {} objects rendered",
         r.maps_with_geometry, r.custom_objects
+    );
+    println!(
+        "Imported environment used for {} difficulties; none for: {:?}",
+        r.with_env, r.no_env
     );
     for (title, list) in [
         ("Errors", &r.errors),
@@ -332,30 +332,58 @@ pub fn save_test(src: &Path, work: &Path) -> i32 {
     }
 }
 
-/// `--render <map folder> <difficulty index> <beat> <out.ppm>`: writes a preview snapshot.
-pub fn render(folder: &Path, diff: usize, beat: f64, out: &Path) -> i32 {
+/// `--render <map folder> <difficulty> <beats> <out dir> [ChroMapper pose]`: writes
+/// `<beat>.ppm` snapshots of the preview. `difficulty` is an index or a name ("ExpertPlus");
+/// `beats` is comma-separated.
+pub fn render(folder: &Path, diff: &str, beats: &str, out: &Path, pose: Option<&str>) -> i32 {
     let run = || -> Result<(), String> {
         let info = map::load_info(folder)?;
-        let d = info.difficulties.get(diff).ok_or("no such difficulty")?;
+        let d = match diff.parse::<usize>() {
+            Ok(i) => info.difficulties.get(i),
+            Err(_) => info
+                .difficulties
+                .iter()
+                .filter(|d| d.name.starts_with("Standard"))
+                .find(|d| d.name.ends_with(&format!(" {diff}"))),
+        }
+        .ok_or_else(|| format!("no difficulty {diff}"))?;
         let mut id = 0;
         let bm = map::load_beatmap(&folder.join(&d.file), &mut id)?;
         let lanes = crate::preview::build(&bm.rows);
         let scene = crate::scene::Scene::parse(&bm.json);
-        let base = if scene.hides_base {
+        let env = crate::environment::EnvFile::load(&d.environment).filter(|_| !scene.hides_base);
+        crate::map::set_base_colors(
+            d.env_right.or(env.as_ref().map(|e| e.blue)).unwrap_or(crate::map::DEFAULT_BASE_COLORS[0]),
+            d.env_left.or(env.as_ref().map(|e| e.red)).unwrap_or(crate::map::DEFAULT_BASE_COLORS[1]),
+        );
+        let base = if scene.hides_base || env.is_some() {
             Vec::new()
         } else {
             crate::view3d::base_stage(&lanes, &bm.rows, &scene)
         };
         let objs: Vec<(&crate::scene::Obj, &crate::scene::Scene)> =
             base.iter().chain(&scene.objects).map(|o| (o, &scene)).collect();
-        let fade = info.bpm / 60.0;
-        let light = |lane: i64, id: Option<i64>| crate::preview::light_rgb(&bm.rows, &lanes, lane, id, beat, fade);
+        let cam = match pose {
+            Some(p) => crate::view3d::Camera::from_chromapper_pose(p).ok_or("bad pose")?,
+            None => crate::view3d::Camera::default(),
+        };
+        let model = crate::cmlight::LightModel::build(&bm, env.as_ref(), &d.colors, info.bpm);
+        std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
         let (w, h) = (1280, 420);
-        let px = crate::view3d::render_rgb(&objs, beat, &light, w, h);
-        let mut data = format!("P6 {w} {h} 255\n").into_bytes();
-        data.extend(px);
-        std::fs::write(out, data).map_err(|e| e.to_string())?;
-        println!("{} · beat {beat}: {} custom objects", d.name, scene.objects.len());
+        for b in beats.split(',').filter_map(|b| b.trim().parse::<f64>().ok()) {
+            let light = |lane: i64, ids: &[i64]| model.rgb_keys(lane, ids, b);
+            let px = crate::view3d::render_rgb(&objs, env.as_ref(), b, &light, &cam, w, h);
+            let mut data = format!("P6 {w} {h} 255\n").into_bytes();
+            data.extend(px);
+            std::fs::write(out.join(format!("{b}.ppm")), data).map_err(|e| e.to_string())?;
+        }
+        println!(
+            "{} · {} · env {}{}",
+            d.name,
+            beats,
+            d.environment,
+            if env.is_some() { " (imported)" } else { " (stand-in)" }
+        );
         Ok(())
     };
     match run() {
@@ -365,4 +393,262 @@ pub fn render(folder: &Path, diff: usize, beat: f64, out: &Path) -> i32 {
             1
         }
     }
+}
+
+/// `--plan-compare <CustomLevels> <jobs.tsv>`: one ChroMapper comparison job per map: its hardest
+/// Standard difficulty and four beats spread over its light events.
+pub fn plan_compare(dir: &Path, jobs: &Path) -> i32 {
+    let mut folders: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|rd| rd.filter_map(Result::ok).map(|e| e.path()).filter(|p| p.is_dir()).collect())
+        .unwrap_or_default();
+    folders.sort();
+    let order = ["ExpertPlus", "Expert", "Hard", "Normal", "Easy"];
+    let mut lines = Vec::new();
+    for (i, f) in folders.iter().enumerate() {
+        let Ok(info) = map::load_info(f) else { continue };
+        let pick = order.iter().find_map(|o| {
+            let d = info.difficulties.iter().find(|d| d.name == format!("Standard {o}"))?;
+            let mut id = 0;
+            let bm = map::load_beatmap(&f.join(&d.file), &mut id).ok()?;
+            let beats: Vec<f64> = bm.rows.iter().flat_map(|r| r.keys.iter().map(|k| k.beat)).collect();
+            let lo = beats.iter().copied().fold(f64::MAX, f64::min);
+            let hi = beats.iter().copied().fold(f64::MIN, f64::max);
+            (hi > lo).then(|| (o.to_string(), lo, hi))
+        });
+        let Some((diff, lo, hi)) = pick else { continue };
+        let beats: Vec<String> = [0.2, 0.4, 0.6, 0.8]
+            .iter()
+            .map(|q| format!("{:.3}", lo + (hi - lo) * q))
+            .collect();
+        let rel = f.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        lines.push(format!("m{i:04}\t/maps/{rel}\t{diff}\t{}", beats.join(",")));
+    }
+    match std::fs::write(jobs, lines.join("\n") + "\n") {
+        Ok(()) => {
+            println!("{} jobs written to {}", lines.len(), jobs.display());
+            0
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            1
+        }
+    }
+}
+
+/// The Info.dat `_customData` of a Standard difficulty.
+fn info_difficulty_custom(folder: &Path, diff: &str) -> Value {
+    let info = ["Info.dat", "info.dat"]
+        .iter()
+        .find_map(|n| std::fs::read_to_string(folder.join(n)).ok())
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .unwrap_or(Value::Null);
+    for set in info["_difficultyBeatmapSets"].as_array().into_iter().flatten() {
+        if set["_beatmapCharacteristicName"] != "Standard" {
+            continue;
+        }
+        for d in set["_difficultyBeatmaps"].as_array().into_iter().flatten() {
+            if d["_difficulty"] == diff {
+                return d["_customData"].clone();
+            }
+        }
+    }
+    Value::Null
+}
+
+/// ChroMapper's `ConvertCustomBpmToOfficial`, which it runs on every map it opens: legacy custom
+/// BPM changes (and a positive `_editorOffset`) become official BPM events, and every object's beat
+/// is moved so its real time stays the same. Returns the map beat (as the game reads it) for
+/// ChroMapper's beat `t`; `t` unchanged when the map has nothing to convert.
+struct CmBpmConversion {
+    song_bpm: f32,
+    /// (beat, bpm), in file order, duplicates of a beat dropped.
+    changes: Vec<(f32, f32)>,
+}
+
+impl CmBpmConversion {
+    fn new(map: &Value, diff_custom: &Value, song_bpm: f64) -> CmBpmConversion {
+        let song_bpm = song_bpm as f32;
+        let mut changes: Vec<(f32, f32)> = Vec::new();
+        let lists = [
+            (&map["_customData"]["_BPMChanges"], "_time", "_BPM"),
+            (&map["_customData"]["_bpmChanges"], "_time", "_BPM"),
+            (&map["_BPMChanges"], "_time", "_BPM"),
+            (&map["_bpmChanges"], "_time", "_BPM"),
+            (&map["customData"]["BPMChanges"], "b", "m"),
+        ];
+        for (list, tk, bk) in lists {
+            for c in list.as_array().into_iter().flatten() {
+                let (Some(t), Some(b)) = (c[tk].as_f64(), c[bk].as_f64()) else { continue };
+                if !changes.iter().any(|x| x.0 == t as f32) {
+                    changes.push((t as f32, b as f32));
+                }
+            }
+        }
+        if let Some(off) = diff_custom["_editorOffset"].as_f64().filter(|o| *o > 0.0) {
+            changes.insert(0, (song_bpm / 60.0 * (off as f32 / 1000.0), song_bpm));
+        }
+        CmBpmConversion { song_bpm, changes }
+    }
+
+    /// Where ChroMapper moves an object at map beat `x`.
+    fn forward(&self, mut x: f32) -> f32 {
+        let mut ch = self.changes.clone();
+        for i in 0..ch.len() {
+            let t = ch[i].0;
+            if (t - t.round()).abs() > 0.01 {
+                let off = 1.0 - t % 1.0;
+                if x >= t {
+                    x += off;
+                }
+                for c in &mut ch[i..] {
+                    c.0 += off;
+                }
+            }
+            let (t, bpm) = ch[i];
+            let next = ch.get(i + 1).map(|c| c.0);
+            let span = next.map_or(0.0, |n| n - t);
+            let scale = bpm / self.song_bpm - 1.0;
+            if t < x {
+                x += if next.is_none_or(|n| x < n) { (x - t) * scale } else { span * scale };
+            }
+            for c in &mut ch[i + 1..] {
+                c.0 += span * scale;
+            }
+        }
+        x
+    }
+
+    fn to_map_beat(&self, t: f64) -> f64 {
+        if self.changes.is_empty() {
+            return t;
+        }
+        // `forward` only ever increases with x: find the map beat it sends to t.
+        let t = t as f32;
+        let (mut lo, mut hi) = (-1.0e5f32, 1.0e5f32);
+        for _ in 0..100 {
+            let mid = (lo + hi) / 2.0;
+            if self.forward(mid) < t { lo = mid } else { hi = mid }
+        }
+        hi as f64
+    }
+}
+
+/// `--compare-lights <CustomLevels> <jobs.tsv> <ChroMapper out dir>`: compares every light's color
+/// recorded in ChroMapper (lights.jsonl) with the preview's color for the same lane, ID and beat.
+pub fn compare_lights(dir: &Path, jobs: &Path, out: &Path) -> i32 {
+    let Ok(text) = std::fs::read_to_string(jobs) else {
+        eprintln!("can't read {}", jobs.display());
+        return 2;
+    };
+    #[derive(Default)]
+    struct Tally {
+        compared: usize,
+        matched: usize,
+        on_off_wrong: usize,
+        maps: usize,
+    }
+    let mut by_env: BTreeMap<String, Tally> = BTreeMap::new();
+    let mut worst: Vec<(f32, String)> = Vec::new();
+    let mut per_map: Vec<(f32, String)> = Vec::new();
+    let mut missing = 0;
+    for line in text.lines() {
+        let cols: Vec<&str> = line.split('\t').collect();
+        let [name, map_path, diff, _beats] = cols[..] else { continue };
+        let folder = dir.join(map_path.trim_start_matches("/maps/"));
+        let Ok(lj) = std::fs::read_to_string(out.join(name).join("lights.jsonl")) else {
+            missing += 1;
+            continue;
+        };
+        let Ok(info) = map::load_info(&folder) else { continue };
+        let Some(d) = info.difficulties.iter().find(|d| d.name == format!("Standard {diff}")) else { continue };
+        let mut id = 0;
+        let Ok(bm) = map::load_beatmap(&folder.join(&d.file), &mut id) else { continue };
+        let env = crate::environment::EnvFile::load(&d.environment);
+        crate::map::set_base_colors(
+            d.env_right.or(env.as_ref().map(|e| e.blue)).unwrap_or(crate::map::DEFAULT_BASE_COLORS[0]),
+            d.env_left.or(env.as_ref().map(|e| e.red)).unwrap_or(crate::map::DEFAULT_BASE_COLORS[1]),
+        );
+        let model = crate::cmlight::LightModel::build_with(&bm, env.as_ref(), &d.colors, info.bpm, true);
+        let diff_custom = info_difficulty_custom(&folder, diff);
+        let conv = CmBpmConversion::new(&bm.json, &diff_custom, info.bpm);
+        let t = by_env.entry(d.environment.clone()).or_default();
+        t.maps += 1;
+        let (mut mc, mut mm) = (0usize, 0usize);
+        for rec in lj.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()) {
+            // ChroMapper compares in f32: an event at exactly the recorded time has fired.
+            let beat = conv.to_map_beat(rec["beat"].as_f64().unwrap_or(0.0)) as f32 as f64;
+            for l in rec["lights"].as_array().into_iter().flatten() {
+                let Some(lane) = l[0].as_i64() else { continue };
+                // One map light ID, or the list of IDs that reach the light (empty: none).
+                let keys: Vec<i64> = match &l[1] {
+                    Value::Array(a) => a.iter().filter_map(Value::as_i64).collect(),
+                    v => v.as_i64().into_iter().collect(),
+                };
+                let lid = keys.first().copied().unwrap_or(-1);
+                if !crate::map::LIGHT_LANES.iter().any(|(t, _)| *t == lane) {
+                    continue;
+                }
+                let c = &l[2];
+                let ch = |i: usize| c[i].as_f64().unwrap_or(0.0) as f32;
+                // Same as LightModel::rgb: brightness above 1 (Chroma alpha > 1) brightens.
+                let a = ch(3).max(0.0);
+                let cm = [ch(0) * a, ch(1) * a, ch(2) * a].map(|v| v.clamp(0.0, 1.0));
+                let ours = model.rgb_keys(lane, &keys, beat);
+                let diffv = (0..3).map(|k| (cm[k] - ours[k]).abs()).fold(0.0, f32::max);
+                let lit = |c: [f32; 3]| c.iter().any(|v| *v > 0.05);
+                t.compared += 1;
+                mc += 1;
+                if diffv <= 0.1 {
+                    t.matched += 1;
+                    mm += 1;
+                } else if lit(cm) != lit(ours) {
+                    t.on_off_wrong += 1;
+                }
+                if diffv > 0.1 {
+                    worst.push((
+                        diffv,
+                        format!(
+                            "{name} {} beat {beat}: lane {lane} id {lid}: ChroMapper {:.2?} vs ours {:.2?}",
+                            d.environment, cm, ours
+                        ),
+                    ));
+                }
+            }
+        }
+        if mc > 0 {
+            per_map.push((
+                mm as f32 / mc as f32,
+                format!("{name} {} [{}] {}/{} lights match", d.environment, map_path, mm, mc),
+            ));
+        }
+    }
+    let (tc, tm): (usize, usize) = by_env.values().fold((0, 0), |a, t| (a.0 + t.compared, a.1 + t.matched));
+    println!(
+        "Light colors compared: {tc}, within 0.1 of ChroMapper: {tm} ({:.1}%); jobs without ChroMapper output: {missing}\n",
+        100.0 * tm as f64 / tc.max(1) as f64
+    );
+    println!("{:30} {:>5} {:>9} {:>7} {:>9}", "environment", "maps", "compared", "match%", "on/off✗");
+    for (env, t) in &by_env {
+        println!(
+            "{env:30} {:>5} {:>9} {:>6.1}% {:>9}",
+            t.maps,
+            t.compared,
+            100.0 * t.matched as f64 / t.compared.max(1) as f64,
+            t.on_off_wrong
+        );
+    }
+    per_map.sort_by(|a, b| a.0.total_cmp(&b.0));
+    println!("\nLowest-matching maps:");
+    for (_, m) in per_map.iter().take(15) {
+        println!("  {m}");
+    }
+    worst.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let all: String = worst.iter().map(|(d, w)| format!("{d:.3}\t{w}\n")).collect();
+    let _ = std::fs::write(out.join("mismatches.txt"), all);
+    println!("\nLargest differences:");
+    for (_, w) in worst.iter().take(15) {
+        println!("  {w}");
+    }
+    println!("(all differences: {})", out.join("mismatches.txt").display());
+    0
 }

@@ -33,20 +33,28 @@ The folder is the one containing `Info.dat`. The last folder is remembered.
 The **Preview** panel at the bottom (toggle in the toolbar, drag its edge to resize) is a 3D
 view from the player's spot at the playhead:
 
+- **Base environment from ChroMapper**: run `tools/import-chromapper-envs.sh` once. It fetches
+  ChroMapper's environment recreations (its prefabs, meshes and materials) and converts them,
+  with ChroMapper's light IDs, ring copies and environment colors. The preview then shows the
+  map's environment ("Environment: Triangle (ChroMapper)") lit by your events. Rings and lasers
+  stay in their resting positions (ring spin/zoom and laser speed aren't animated yet).
+  ChroMapper doesn't have the newer environments (Weave, Pyro, The Weeknd, Rock Mixtape, …) or
+  Green Day; those maps, and any map before you import, fall back to a generic stand-in stage.
 - **Custom geometry from the map is exact**: Chroma `environment` objects (cubes, spheres,
   cylinders, planes, quads, triangles) with their materials, lit by your light events through
   their `ILightWithId` lane and light ID, and moved by `AnimateTrack` (position, rotation,
   scale, easings, repeat, point definitions).
-- **The base environment is approximate**: the game's own scene isn't in the map, so a generic
-  stage (back lasers, rings, side lasers, center lights) stands in. It's turned off
-  automatically when the map hides base objects; toggle it with "Base stage".
-- Not previewed: edits that move base-game objects, Vivify events, track parenting, bloom
-  and fog are only approximated.
+- Not previewed: edits that move base-game objects, Vivify events (those need Unity; see
+  ChroMapper-PropPreview), track parenting. Bloom is approximated with glowing lines.
 
 Drag to look around, use the wheel to move, double-click to reset the camera.
 
-Key shapes: ◆ On, ● Transition, ▲ Flash, ▼ Fade, ■ Off. A **Transition** key blends from
-the key before it using its easing, so chained transitions work like animation curves.
+ChroMapper is GPL-2.0, so its source and the converted environments are kept in
+`~/.local/share/bs-light-timeline/`, not in this repository.
+
+Key shapes: ◆ On, ● Transition, ▲ Flash, ▼ Fade, ■ Off. A **Transition** key is blended into
+from the key before it, and that earlier key's "Easing to next" sets the curve (this is how the
+game and ChroMapper read it), so chained transitions work like animation curves.
 
 The first save of a session copies the original file to `<file>.timeline-backup-<time>`.
 Don't edit the same difficulty in ChroMapper at the same time: whichever saves last wins.

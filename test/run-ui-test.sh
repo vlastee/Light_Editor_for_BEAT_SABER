@@ -7,7 +7,11 @@ maps=$1; out=$2
 mkdir -p "$out"
 podman build -q -t bs-light-timeline-test -f "$here/Containerfile" "$here" >/dev/null
 podman rm -f bslt-ui >/dev/null 2>&1 || true
-podman run -d --name bslt-ui \
+envs="$HOME/.local/share/bs-light-timeline/environments"
+env_mount=""
+[ -d "$envs" ] && env_mount="-v $envs:/tmp/home/.local/share/bs-light-timeline/environments:ro,Z"
+# shellcheck disable=SC2086
+podman run -d --name bslt-ui $env_mount \
     -v "$here/../target/release/bs-light-timeline:/app/bslt:ro,Z" \
     -v "$maps:/maps:ro" -v "$out:/out:Z" -v "$here/ui-steps.sh:/ui-steps.sh:ro,Z" \
     -e HOME=/tmp/home -e DISPLAY=:99 -e LIBGL_ALWAYS_SOFTWARE=1 \

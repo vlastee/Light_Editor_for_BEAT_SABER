@@ -3,6 +3,8 @@
 use crate::audio::{PEAK_BLOCK, Player, Song};
 use crate::eval;
 use crate::preview::{self, LaneLights};
+use crate::cmlight::LightModel;
+use crate::environment::EnvFile;
 use crate::scene::{Obj, Scene};
 use crate::view3d::{self, Camera};
 use crate::map::{self, Base, Beatmap, Key, Kind, LoadedMap, Row};
@@ -125,6 +127,13 @@ pub struct App {
     base_objs: Vec<Obj>,
     show_base: bool,
     camera: Camera,
+    env: Option<EnvFile>,
+    env_name: String,
+    /// ChroMapper-faithful light colors; rebuilt when `rows_gen` moves past `model_gen`.
+    model: Option<LightModel>,
+    rows_gen: u64,
+    model_gen: u64,
+    env_colors: map::MapColors,
     /// Widgets that take typed text; shortcuts are off only while one of these has focus.
     text_inputs: Vec<egui::Id>,
 }
@@ -262,6 +271,12 @@ impl App {
             base_objs: Vec::new(),
             show_base: true,
             camera: Camera::default(),
+            env: None,
+            env_name: String::new(),
+            model: None,
+            rows_gen: 1,
+            model_gen: 0,
+            env_colors: map::MapColors::default(),
             text_inputs: Vec::new(),
         };
         if !app.path_input.is_empty() {
@@ -307,6 +322,12 @@ impl App {
             self.status = "This map has no difficulty files".into();
             return;
         };
+        let env = EnvFile::load(&d.environment);
+        map::set_base_colors(
+            d.env_right.or(env.as_ref().map(|e| e.blue)).unwrap_or(map::DEFAULT_BASE_COLORS[0]),
+            d.env_left.or(env.as_ref().map(|e| e.red)).unwrap_or(map::DEFAULT_BASE_COLORS[1]),
+        );
+        let env_name = d.environment.clone();
         match map::load_beatmap(&m.folder.join(&d.file), &mut self.next_id) {
             Ok(bm) => {
                 self.collapsed = map::LIGHT_LANES
@@ -317,7 +338,15 @@ impl App {
                 self.palette = compute_palette(&bm.rows);
                 self.preview_lights = preview::build(&bm.rows);
                 self.scene = Scene::parse(&bm.json);
-                self.base_objs = view3d::base_stage(&self.preview_lights, &bm.rows, &self.scene);
+                self.base_objs = if env.is_some() {
+                    Vec::new()
+                } else {
+                    view3d::base_stage(&self.preview_lights, &bm.rows, &self.scene)
+                };
+                self.env = env;
+                self.env_name = env_name;
+                self.env_colors = d.colors;
+                self.rows_gen += 1;
                 self.show_base = !self.scene.hides_base;
                 self.status = format!(
                     "Loaded {} ({} light events in {} rows)",
@@ -350,6 +379,23 @@ impl App {
                 Err(e) => self.status = e,
             }
         }
+    }
+
+    // ---- light model ----
+
+    fn refresh_model(&mut self) {
+        if self.model_gen == self.rows_gen {
+            return;
+        }
+        self.model_gen = self.rows_gen;
+        let bpm = self.bpm();
+        self.model = self.beatmap.as_ref().map(|bm| {
+            LightModel::build(bm, self.env.as_ref(), &self.env_colors, bpm)
+        });
+    }
+
+    fn light_rgb(&self, row: &Row, beat: f64) -> [f32; 3] {
+        self.model.as_ref().map_or([0.0; 3], |m| m.row_rgb(row, beat))
     }
 
     // ---- time / view helpers ----
@@ -430,6 +476,7 @@ impl App {
             Some(prev) => {
                 self.redo.push(std::mem::replace(&mut bm.rows, prev));
                 self.dirty = true;
+        self.rows_gen += 1;
                 self.status = format!("Undo ({} more)", self.undo.len());
             }
             None => self.status = "Nothing to undo".into(),
@@ -442,6 +489,7 @@ impl App {
             Some(next) => {
                 self.undo.push(std::mem::replace(&mut bm.rows, next));
                 self.dirty = true;
+        self.rows_gen += 1;
                 self.status = format!("Redo ({} more)", self.redo.len());
             }
             None => self.status = "Nothing to redo".into(),
@@ -493,6 +541,7 @@ impl App {
         self.selected = HashSet::from([id]);
         self.active_row = Some(row_idx);
         self.dirty = true;
+        self.rows_gen += 1;
     }
 
     fn delete_selected(&mut self) {
@@ -507,6 +556,7 @@ impl App {
         }
         self.selected.clear();
         self.dirty = true;
+        self.rows_gen += 1;
     }
 
     fn copy_selected(&mut self) {
@@ -562,6 +612,7 @@ impl App {
         self.status = format!("Pasted {} keys at beat {at:.3}", new_ids.len());
         self.selected = new_ids;
         self.dirty = true;
+        self.rows_gen += 1;
     }
 
     fn selected_beats(&self) -> HashMap<u64, f64> {
@@ -574,6 +625,7 @@ impl App {
     }
 
     fn set_beats(&mut self, orig: &HashMap<u64, f64>, delta: f64) {
+        self.rows_gen += 1;
         if let Some(bm) = &mut self.beatmap {
             for k in bm.rows.iter_mut().flat_map(|r| r.keys.iter_mut()) {
                 if let Some(b) = orig.get(&k.id) {
@@ -858,6 +910,7 @@ impl App {
                             bm.rows.iter_mut().for_each(Row::sort);
                         }
                         self.dirty = true;
+        self.rows_gen += 1;
                     } else {
                         self.undo.pop();
                     }
@@ -974,7 +1027,6 @@ impl App {
             Pos2::new(self.tl_left, full.bottom()),
         ));
         let view_end = self.x_to_beat(tl.right());
-        let fade_beats = self.bpm() / 60.0;
 
         // Row backgrounds.
         for l in lines.iter().filter(|l| l.y + l.h >= rows_top && l.y <= full.bottom()) {
@@ -1027,11 +1079,7 @@ impl App {
                         let mut x = tl.left();
                         let mut run: Option<(f32, Color32)> = None;
                         while x < tl.right() {
-                            let c = rgb32(eval::row_color(
-                                row,
-                                self.x_to_beat(x + 1.5),
-                                fade_beats,
-                            ));
+                            let c = rgb32(self.light_rgb(row, self.x_to_beat(x + 1.5)));
                             match run {
                                 Some((_, rc)) if rc == c => {}
                                 Some((x0, rc)) => {
@@ -1117,7 +1165,7 @@ impl App {
                     lp.rect_filled(
                         sw,
                         2.0,
-                        rgb32(eval::row_color(row, self.playhead, fade_beats)),
+                        rgb32(self.light_rgb(row, self.playhead)),
                     );
                     lp.text(
                         Pos2::new(full.left() + 44.0, cy),
@@ -1331,8 +1379,8 @@ impl App {
             ui.label(egui::RichText::new("Shapes").strong());
             ui.label("◆ On   ● Transition   ▲ Flash   ▼ Fade   ■ Off");
             ui.label(
-                "A Transition key blends from the key before it, using its easing. \
-                 Chain transitions to build curves.",
+                "A Transition key is blended into from the key before it; that earlier key's \
+                 \"Easing to next\" sets the curve. Chain transitions to build curves.",
             );
             return;
         };
@@ -1410,8 +1458,11 @@ impl App {
             }
             ui.end_row();
 
-            ui.label("Easing");
-            ui.add_enabled_ui(t.kind == Kind::Transition, |ui| {
+            // The game (and ChroMapper) take a transition's easing and blend from the key before it.
+            let starts_transition = matches!(t.kind, Kind::On | Kind::Off | Kind::Transition);
+            ui.label("Easing to next")
+                .on_hover_text("Used when the next key is a Transition: how this key blends into it.");
+            ui.add_enabled_ui(starts_transition, |ui| {
                 egui::ComboBox::from_id_salt("easing")
                     .selected_text(t.easing.as_deref().unwrap_or("easeLinear"))
                     .height(400.0)
@@ -1428,8 +1479,8 @@ impl App {
             });
             ui.end_row();
 
-            ui.label("Blend");
-            ui.add_enabled_ui(t.kind == Kind::Transition, |ui| {
+            ui.label("Blend to next");
+            ui.add_enabled_ui(starts_transition, |ui| {
                 let mut hsv = t.lerp_hsv;
                 if ui
                     .checkbox(&mut hsv, "HSV (around the color wheel)")
@@ -1486,15 +1537,26 @@ impl App {
                 }
             }
             self.dirty = true;
+        self.rows_gen += 1;
         }
     }
 
     fn preview_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.checkbox(&mut self.show_base, "Base stage (approximate)").on_hover_text(
-                "The game's own environment isn't stored in the map, so this is a generic \
-                 stand-in. Custom geometry from the map is drawn exactly.",
-            );
+            let short = self.env_name.trim_end_matches("Environment");
+            if self.env.is_some() {
+                ui.checkbox(&mut self.show_base, format!("Environment: {short} (ChroMapper)"))
+                    .on_hover_text(
+                        "Imported from ChroMapper's recreation of this environment, with its light \
+                         IDs. Rings and lasers stay in their resting positions.",
+                    );
+            } else {
+                ui.checkbox(&mut self.show_base, "Base stage (approximate)").on_hover_text(format!(
+                    "No imported environment for {}. Run --import-chromapper (see README) \
+                     to use ChroMapper's environments; until then this is a generic stand-in.",
+                    self.env_name
+                ));
+            }
             if ui.button("Reset camera").clicked() {
                 self.camera = Camera::default();
             }
@@ -1549,17 +1611,17 @@ impl App {
             painter.rect_filled(rect, 0.0, Color32::from_rgb(4, 4, 8));
             return;
         };
-        let fade = self.bpm() / 60.0;
+        let _ = bm;
         let beat = self.playhead;
-        let lanes = &self.preview_lights;
-        let rows = &bm.rows;
-        let light = |lane: i64, id: Option<i64>| preview::light_rgb(rows, lanes, lane, id, beat, fade);
+        let model = self.model.as_ref();
+        let light = |lane: i64, ids: &[i64]| model.map_or([0.0; 3], |m| m.rgb_keys(lane, ids, beat));
         let mut objs: Vec<(&Obj, &Scene)> = Vec::new();
         if self.show_base {
             objs.extend(self.base_objs.iter().map(|o| (o, &self.scene)));
         }
         objs.extend(self.scene.objects.iter().map(|o| (o, &self.scene)));
-        view3d::paint(&painter, rect, &objs, beat, &light, &self.camera);
+        let env = self.env.as_ref().filter(|_| self.show_base);
+        view3d::paint(&painter, rect, &objs, env, beat, &light, &self.camera);
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
@@ -1703,6 +1765,7 @@ impl eframe::App for App {
 
         self.handle_keys(&ctx);
         self.text_inputs.clear();
+        self.refresh_model();
 
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(4.0);

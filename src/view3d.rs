@@ -1,6 +1,7 @@
 //! Software 3D preview drawn with egui meshes: perspective camera from the player's spot,
 //! painter's-algorithm depth sorting, near-plane clipping and a cheap bloom halo on lights.
 
+use crate::environment::EnvFile;
 use crate::preview::LaneLights;
 use crate::scene::{Obj, Prim, Quat, Scene};
 use eframe::egui::{Color32, Mesh, Painter, Pos2, Rect, Shape};
@@ -14,6 +15,19 @@ pub struct Camera {
     pub yaw: f32,
     pub pitch: f32,
     pub vfov: f32,
+}
+
+impl Camera {
+    /// From a ChroMapper camera pose "x,y,z,rx,ry,rz,fov" (its lane units, Unity euler degrees).
+    pub fn from_chromapper_pose(pose: &str) -> Option<Camera> {
+        let v: Vec<f32> = pose.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        (v.len() >= 7).then(|| Camera {
+            pos: [v[0] * 0.6, v[1] * 0.6, v[2] * 0.6],
+            yaw: v[4],
+            pitch: -v[3],
+            vfov: v[6],
+        })
+    }
 }
 
 impl Default for Camera {
@@ -37,7 +51,7 @@ fn norm(a: V3) -> V3 {
 }
 
 /// Unit primitives as triangle lists, matching Unity's built-in meshes.
-fn mesh(p: Prim) -> &'static [[V3; 3]] {
+pub fn mesh(p: Prim) -> &'static [[V3; 3]] {
     static CACHE: OnceLock<Vec<Vec<[V3; 3]>>> = OnceLock::new();
     let all = CACHE.get_or_init(|| {
         let quad = |a: V3, b: V3, c: V3, d: V3| vec![[a, b, c], [a, c, d]];
@@ -203,6 +217,18 @@ struct Tri {
     color: Color32,
 }
 
+/// A lit thin light drawn as a glowing screen-space line (stands in for bloom).
+struct Beam {
+    a: Pos2,
+    b: Pos2,
+    color: Color32,
+}
+
+struct Frame {
+    tris: Vec<Tri>,
+    beams: Vec<Beam>,
+}
+
 fn rgba(c: [f32; 3], a: f32) -> Color32 {
     let [r, g, b] = c.map(|v| (v.clamp(0.0, 1.0) * 255.0) as u8);
     Color32::from_rgba_unmultiplied(r, g, b, (a.clamp(0.0, 1.0) * 255.0) as u8)
@@ -211,11 +237,12 @@ fn rgba(c: [f32; 3], a: f32) -> Color32 {
 /// Builds the depth-sorted triangles for one frame.
 fn build(
     objects: &[(&Obj, &Scene)],
+    env: Option<&EnvFile>,
     beat: f64,
-    light_rgb: &dyn Fn(i64, Option<i64>) -> [f32; 3],
+    light_rgb: &dyn Fn(i64, &[i64]) -> [f32; 3],
     cam: &Camera,
     rect: Rect,
-) -> Vec<Tri> {
+) -> Frame {
     let (yaw, pitch) = (cam.yaw.to_radians(), cam.pitch.to_radians());
     let fwd = [yaw.sin() * pitch.cos(), pitch.sin(), yaw.cos() * pitch.cos()];
     let right = norm(cross([0.0, 1.0, 0.0], fwd));
@@ -225,15 +252,31 @@ fn build(
     let near = 0.1;
     let sun = norm([0.4, 1.0, -0.6]);
 
+    let to_view = |p: V3| {
+        let d = sub(p, cam.pos);
+        [dot(d, right), dot(d, up), dot(d, fwd)]
+    };
+    let proj = |v: V3| Pos2::new(center.x + v[0] / v[2] * focal, center.y - v[1] / v[2] * focal);
+    let mut beams = Vec::new();
+    let mut beam = |a: V3, b: V3, c: [f32; 3]| {
+        let (mut va, mut vb) = (to_view(a), to_view(b));
+        if va[2] < near && vb[2] < near {
+            return;
+        }
+        let clip = |p: V3, q: V3| {
+            let t = (near - p[2]) / (q[2] - p[2]);
+            [p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t, near]
+        };
+        if va[2] < near {
+            va = clip(va, vb);
+        } else if vb[2] < near {
+            vb = clip(vb, va);
+        }
+        beams.push(Beam { a: proj(va), b: proj(vb), color: rgba(c, 1.0) });
+    };
     let mut tris = Vec::new();
     let mut push = |world: [V3; 3], color: Color32, bias: f32| {
-        let view: Vec<V3> = world
-            .iter()
-            .map(|p| {
-                let d = sub(*p, cam.pos);
-                [dot(d, right), dot(d, up), dot(d, fwd)]
-            })
-            .collect();
+        let view: Vec<V3> = world.iter().map(|p| to_view(*p)).collect();
         // Clip against the near plane (gives 0, 1 or 2 triangles).
         let mut poly: Vec<V3> = Vec::with_capacity(4);
         for i in 0..3 {
@@ -249,7 +292,6 @@ fn build(
         if poly.len() < 3 {
             return;
         }
-        let proj = |v: V3| Pos2::new(center.x + v[0] / v[2] * focal, center.y - v[1] / v[2] * focal);
         let depth = poly.iter().map(|v| v[2]).sum::<f32>() / poly.len() as f32 + bias;
         for k in 1..poly.len() - 1 {
             tris.push(Tri { pts: [proj(poly[0]), proj(poly[k]), proj(poly[k + 1])], depth, color });
@@ -258,7 +300,7 @@ fn build(
 
     for (o, scene) in objects {
         let (pos, rot, scale) = scene.transform(o, beat);
-        let lit = o.light.map(|(lane, id)| light_rgb(lane, id));
+        let lit = o.light.map(|(lane, id)| light_rgb(lane, id.as_slice()));
         let to_world = |v: V3, grow: f32| {
             let s = [v[0] * (scale[0] + grow), v[1] * (scale[1] + grow), v[2] * (scale[2] + grow)];
             let r = rot.rotate(s);
@@ -278,6 +320,22 @@ fn build(
             };
             push(w, color, 0.0);
         }
+        // Long thin lit cubes also get a glowing line along their length.
+        if let Some(c) = lit.filter(|c| c.iter().any(|v| *v > 0.02) && o.prim == Prim::Cube) {
+            let (mut axis, mut long) = (0, scale[0].abs());
+            for k in 1..3 {
+                if scale[k].abs() > long {
+                    (axis, long) = (k, scale[k].abs());
+                }
+            }
+            let thick = (0..3).filter(|k| *k != axis).map(|k| scale[k].abs()).fold(0.0, f32::max);
+            if long > 6.0 * thick {
+                let mut e = [0.0; 3];
+                e[axis] = 0.5;
+                let m = [-e[0], -e[1], -e[2]];
+                beam(to_world(m, 0.0), to_world(e, 0.0), c);
+            }
+        }
         // Bloom halo: a slightly larger, faint copy behind lit lights.
         if let Some(c) = lit.filter(|c| c.iter().any(|v| *v > 0.02)) {
             let grow = 0.35;
@@ -286,18 +344,64 @@ fn build(
             }
         }
     }
+    // Imported base environment: static world-space triangles.
+    for o in env.map(|e| e.objects.as_slice()).unwrap_or_default() {
+        let tri_at = |i: usize| -> [V3; 3] {
+            let t = &o.tris[i * 9..i * 9 + 9];
+            [[t[0], t[1], t[2]], [t[3], t[4], t[5]], [t[6], t[7], t[8]]]
+        };
+        let n_tris = o.tris.len() / 9;
+        match &o.light {
+            Some((lane, ids)) => {
+                let c = light_rgb(*lane, ids);
+                let on = c.iter().any(|v| *v > 0.02);
+                let color = if on { rgba(c, 0.95) } else { Color32::from_rgb(14, 14, 18) };
+                for i in 0..n_tris {
+                    push(tri_at(i), color, 0.0);
+                }
+                if let (true, Some((a, b))) = (on, o.beam) {
+                    beam(a, b, c);
+                }
+                if on {
+                    let mut centre = [0.0f32; 3];
+                    for v in o.tris.chunks(3) {
+                        for k in 0..3 {
+                            centre[k] += v[k];
+                        }
+                    }
+                    let n = (o.tris.len() / 3).max(1) as f32;
+                    let centre = centre.map(|c| c / n);
+                    let halo = rgba(c, 0.16);
+                    for i in 0..n_tris {
+                        let t = tri_at(i).map(|v| std::array::from_fn(|k| centre[k] + (v[k] - centre[k]) * 1.08));
+                        push(t, halo, 0.05);
+                    }
+                }
+            }
+            None => {
+                for i in 0..n_tris {
+                    let w = tri_at(i);
+                    let n = norm(cross(sub(w[1], w[0]), sub(w[2], w[0])));
+                    let shade = 0.25 + 0.5 * dot(n, sun).abs();
+                    let c = [o.color[0], o.color[1], o.color[2]].map(|c| c * shade * 0.8);
+                    push(w, rgba(c, 1.0), 0.0);
+                }
+            }
+        }
+    }
     tris.sort_by(|a, b| b.depth.total_cmp(&a.depth));
-    tris
+    Frame { tris, beams }
 }
 
 /// Number of triangles a frame produces; used by the map checker.
 pub fn triangle_count(
     objects: &[(&Obj, &Scene)],
+    env: Option<&EnvFile>,
     beat: f64,
-    light_rgb: &dyn Fn(i64, Option<i64>) -> [f32; 3],
+    light_rgb: &dyn Fn(i64, &[i64]) -> [f32; 3],
 ) -> usize {
     let rect = Rect::from_min_size(Pos2::ZERO, eframe::egui::vec2(1280.0, 400.0));
-    let tris = build(objects, beat, light_rgb, &Camera::default(), rect);
+    let tris = build(objects, env, beat, light_rgb, &Camera::default(), rect).tris;
     assert!(tris.iter().all(|t| t.pts.iter().all(|p| p.x.is_finite() && p.y.is_finite())));
     tris.len()
 }
@@ -306,12 +410,13 @@ pub fn paint(
     painter: &Painter,
     rect: Rect,
     objects: &[(&Obj, &Scene)],
+    env: Option<&EnvFile>,
     beat: f64,
-    light_rgb: &dyn Fn(i64, Option<i64>) -> [f32; 3],
+    light_rgb: &dyn Fn(i64, &[i64]) -> [f32; 3],
     cam: &Camera,
 ) {
     painter.rect_filled(rect, 0.0, Color32::from_rgb(4, 4, 8));
-    let tris = build(objects, beat, light_rgb, cam, rect);
+    let Frame { tris, beams } = build(objects, env, beat, light_rgb, cam, rect);
     // egui meshes use 32-bit indices; split very large frames anyway to keep buffers modest.
     for chunk in tris.chunks(60_000) {
         let mut m = Mesh::default();
@@ -324,19 +429,27 @@ pub fn paint(
         }
         painter.add(Shape::mesh(m));
     }
+    for b in &beams {
+        let glow = Color32::from_rgba_unmultiplied(b.color.r(), b.color.g(), b.color.b(), 45);
+        painter.line_segment([b.a, b.b], eframe::egui::Stroke::new(7.0, glow));
+        painter.line_segment([b.a, b.b], eframe::egui::Stroke::new(2.2, b.color));
+    }
 }
 
 /// Rasterizes one frame to RGB bytes (for `--render` snapshots; same triangles as the UI).
 pub fn render_rgb(
     objects: &[(&Obj, &Scene)],
+    env: Option<&EnvFile>,
     beat: f64,
-    light_rgb: &dyn Fn(i64, Option<i64>) -> [f32; 3],
+    light_rgb: &dyn Fn(i64, &[i64]) -> [f32; 3],
+    cam: &Camera,
     w: usize,
     h: usize,
 ) -> Vec<u8> {
     let rect = Rect::from_min_size(Pos2::ZERO, eframe::egui::vec2(w as f32, h as f32));
     let mut img = vec![[4.0f32, 4.0, 8.0]; w * h];
-    for t in build(objects, beat, light_rgb, &Camera::default(), rect) {
+    let frame = build(objects, env, beat, light_rgb, cam, rect);
+    for t in frame.tris {
         let [a, b, c] = t.pts;
         let (x0, x1) = (a.x.min(b.x).min(c.x).max(0.0) as usize, (a.x.max(b.x).max(c.x).ceil() as usize).min(w));
         let (y0, y1) = (a.y.min(b.y).min(c.y).max(0.0) as usize, (a.y.max(b.y).max(c.y).ceil() as usize).min(h));
@@ -352,6 +465,22 @@ pub fn render_rgb(
                 let e = |p0: Pos2, p1: Pos2| ((p1.x - p0.x) * (p.y - p0.y) - (p1.y - p0.y) * (p.x - p0.x)) / area;
                 if e(a, b) >= 0.0 && e(b, c) >= 0.0 && e(c, a) >= 0.0 {
                     let px = &mut img[y * w + x];
+                    for i in 0..3 {
+                        px[i] = px[i] * (1.0 - alpha) + col[i] * alpha;
+                    }
+                }
+            }
+        }
+    }
+    for b in &frame.beams {
+        let col = [b.color.r(), b.color.g(), b.color.b()].map(f32::from);
+        let steps = (b.b - b.a).length().ceil().clamp(1.0, 4000.0) as usize;
+        for s in 0..=steps {
+            let p = b.a + (b.b - b.a) * (s as f32 / steps as f32);
+            for (dx, dy, alpha) in [(0, 0, 1.0), (1, 0, 0.6), (0, 1, 0.6), (-1, 0, 0.6), (0, -1, 0.6)] {
+                let (x, y) = (p.x as i64 + dx, p.y as i64 + dy);
+                if x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h {
+                    let px = &mut img[y as usize * w + x as usize];
                     for i in 0..3 {
                         px[i] = px[i] * (1.0 - alpha) + col[i] * alpha;
                     }

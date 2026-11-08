@@ -65,12 +65,29 @@ impl Base {
     }
 
     /// Approximate default environment colors, used when an event has no Chroma color.
+    /// The environment's color for events without a Chroma color (see [`set_base_colors`]).
     pub fn rgba(self) -> [f32; 4] {
+        let c = BASE_COLORS.read().map_or(DEFAULT_BASE_COLORS, |c| *c);
         match self {
-            Base::Blue => [0.19, 0.6, 1.0, 1.0],
-            Base::Red => [1.0, 0.22, 0.22, 1.0],
-            Base::White => [1.0, 1.0, 1.0, 1.0],
+            Base::Blue => c[0],
+            Base::Red => c[1],
+            Base::White => c[2],
         }
+    }
+}
+
+/// Beat Saber's default scheme: right (blue) and left (red) environment colors, and white.
+pub const DEFAULT_BASE_COLORS: [[f32; 4]; 3] = [
+    [0.188, 0.675, 1.0, 1.0],
+    [0.85, 0.085, 0.085, 1.0],
+    [1.0, 1.0, 1.0, 1.0],
+];
+
+static BASE_COLORS: std::sync::RwLock<[[f32; 4]; 3]> = std::sync::RwLock::new(DEFAULT_BASE_COLORS);
+
+pub fn set_base_colors(blue: [f32; 4], red: [f32; 4]) {
+    if let Ok(mut c) = BASE_COLORS.write() {
+        *c = [blue, red, DEFAULT_BASE_COLORS[2]];
     }
 }
 
@@ -180,6 +197,47 @@ impl Row {
 pub struct Difficulty {
     pub name: String,
     pub file: String,
+    pub environment: String,
+    /// Light colors the map overrides (difficulty custom data or an Info color scheme).
+    pub colors: MapColors,
+    /// `colors.left` / `colors.right`, kept for the timeline's base colors.
+    pub env_left: Option<[f32; 4]>,
+    pub env_right: Option<[f32; 4]>,
+}
+
+/// Environment light colors a map overrides, resolved like ChroMapper's `PopulateColorsFromMapInfo`.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+pub struct MapColors {
+    pub left: Option<[f32; 4]>,
+    pub right: Option<[f32; 4]>,
+    pub white: Option<[f32; 4]>,
+    pub left_boost: Option<[f32; 4]>,
+    pub right_boost: Option<[f32; 4]>,
+    pub white_boost: Option<[f32; 4]>,
+}
+
+impl MapColors {
+    /// `cd`: the difficulty's custom data; `scheme`: the Info color scheme it uses, if that
+    /// scheme overrides colors.
+    fn resolve(cd: &Value, scheme: Option<&Value>) -> MapColors {
+        let c = |k: &str| rgb_obj(&cd[k]);
+        let s = |k: &str| scheme.and_then(|s| rgb_obj(&s[k]));
+        let (note_l, note_r) = (c("_colorLeft"), c("_colorRight"));
+        let (env_l, env_r) = (c("_envColorLeft"), c("_envColorRight"));
+        MapColors {
+            left: env_l.or(note_l).or(s("environmentColor0")),
+            right: env_r.or(note_r).or(s("environmentColor1")),
+            white: c("_envColorWhite").or(s("environmentColorW")),
+            left_boost: c("_envColorLeftBoost").or(env_l).or(note_l).or(s("environmentColor0Boost")),
+            right_boost: c("_envColorRightBoost").or(env_r).or(note_r).or(s("environmentColor1Boost")),
+            white_boost: c("_envColorWhiteBoost").or(s("environmentColorWBoost")),
+        }
+    }
+}
+
+fn rgb_obj(v: &Value) -> Option<[f32; 4]> {
+    let c = |k: &str, d: f64| v.get(k).and_then(Value::as_f64).unwrap_or(d) as f32;
+    v.is_object().then(|| [c("r", 0.0), c("g", 0.0), c("b", 0.0), c("a", 1.0)])
 }
 
 pub struct LoadedMap {
@@ -265,9 +323,23 @@ pub fn load_info(folder: &Path) -> Result<LoadedMap, String> {
         for set in info["_difficultyBeatmapSets"].as_array().into_iter().flatten() {
             let ch = set["_beatmapCharacteristicName"].as_str().unwrap_or("?");
             for d in set["_difficultyBeatmaps"].as_array().into_iter().flatten() {
+                let cd = &d["_customData"];
+                // ChroMapper reads a missing index as 0.
+                let scheme = info["_colorSchemes"]
+                    .get(d["_beatmapColorSchemeIdx"].as_u64().unwrap_or(0) as usize)
+                    .filter(|s| s["useOverride"].as_bool() == Some(true))
+                    .map(|s| &s["colorScheme"]);
+                let colors = MapColors::resolve(cd, scheme);
                 difficulties.push(Difficulty {
                     name: format!("{ch} {}", d["_difficulty"].as_str().unwrap_or("?")),
                     file: d["_beatmapFilename"].as_str().unwrap_or_default().to_owned(),
+                    environment: info["_environmentName"]
+                        .as_str()
+                        .unwrap_or("DefaultEnvironment")
+                        .to_owned(),
+                    colors,
+                    env_left: colors.left,
+                    env_right: colors.right,
                 });
             }
         }
@@ -290,6 +362,15 @@ pub fn load_info(folder: &Path) -> Result<LoadedMap, String> {
                     d["difficulty"].as_str().unwrap_or("?")
                 ),
                 file: d["beatmapDataFilename"].as_str().unwrap_or_default().to_owned(),
+                environment: d["environmentNameIdx"]
+                    .as_u64()
+                    .and_then(|i| info["environmentNames"].get(i as usize))
+                    .and_then(Value::as_str)
+                    .unwrap_or("DefaultEnvironment")
+                    .to_owned(),
+                colors: MapColors::default(),
+                env_left: None,
+                env_right: None,
             });
         }
         (
@@ -351,7 +432,9 @@ pub fn load_beatmap(path: &Path, next_id: &mut u64) -> Result<Beatmap, String> {
         extra.remove(n.et);
         let value = extra.remove(n.i).and_then(|v| v.as_i64()).unwrap_or(0);
         let brightness_src = extra.remove(n.f);
-        let brightness = brightness_src.as_ref().and_then(Value::as_f64).unwrap_or(1.0) as f32;
+        // A missing brightness is 0 in v3 (the game's default) and 1 in v2 (as ChroMapper reads it).
+        let default_f = if n.version == "v3" { 0.0 } else { 1.0 };
+        let brightness = brightness_src.as_ref().and_then(Value::as_f64).unwrap_or(default_f) as f32;
         let mut custom = match extra.remove(n.custom) {
             Some(Value::Object(m)) => m,
             _ => Map::new(),

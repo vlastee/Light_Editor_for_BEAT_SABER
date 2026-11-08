@@ -1,0 +1,7 @@
+# ChroMapper (native Linux build, mounted read-only) on Xvfb with software Vulkan (lavapipe),
+# for side-by-side renders against the preview. Builds on the UI test image.
+FROM localhost/bs-light-timeline-test
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        mesa-vulkan-drivers libvulkan1 libgtk-3-0t64 libpulse0 libxinerama1 libxss1 libxxf86vm1 \
+        python3 \
+    && rm -rf /var/lib/apt/lists/*

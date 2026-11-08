@@ -1,1 +1,5 @@
 /target
+/test/chromapper-probe/bin
+/test/chromapper-probe/obj
+/test/chromapper-probe/out
+/test/out

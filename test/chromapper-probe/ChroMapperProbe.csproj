@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Test-only ChroMapper plugin; loaded only inside the comparison container. -->
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <ChroMapperDir Condition="'$(ChroMapperDir)' == ''">$(HOME)/Applications/chromapper</ChroMapperDir>
+    <M>$(ChroMapperDir)/ChroMapper_Data/Managed</M>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="Main"><HintPath>$(M)/Main.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Plugins"><HintPath>$(M)/Plugins.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine"><HintPath>$(M)/UnityEngine.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.CoreModule"><HintPath>$(M)/UnityEngine.CoreModule.dll</HintPath><Private>false</Private></Reference>
+  </ItemGroup>
+</Project>

@@ -1,6 +1,8 @@
 mod app;
 mod audio;
 mod check;
+mod cmlight;
+mod environment;
 mod eval;
 mod map;
 mod preview;
@@ -30,13 +32,22 @@ fn main() -> eframe::Result {
         ));
     }
     if args.first().map(String::as_str) == Some("--render") && args.len() >= 5 {
-        let diff = args[2].parse().unwrap_or(0);
-        let beat = args[3].parse().unwrap_or(0.0);
         std::process::exit(check::render(
             std::path::Path::new(&args[1]),
-            diff,
-            beat,
+            &args[2],
+            &args[3],
             std::path::Path::new(&args[4]),
+            args.get(5).map(String::as_str),
+        ));
+    }
+    if args.first().map(String::as_str) == Some("--plan-compare") && args.len() >= 3 {
+        std::process::exit(check::plan_compare(std::path::Path::new(&args[1]), std::path::Path::new(&args[2])));
+    }
+    if args.first().map(String::as_str) == Some("--compare-lights") && args.len() >= 4 {
+        std::process::exit(check::compare_lights(
+            std::path::Path::new(&args[1]),
+            std::path::Path::new(&args[2]),
+            std::path::Path::new(&args[3]),
         ));
     }
     let map_folder = args.into_iter().next();
