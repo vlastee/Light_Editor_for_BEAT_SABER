@@ -221,17 +221,51 @@ struct Tri {
 struct Beam {
     a: Pos2,
     b: Pos2,
-    color: Color32,
+    color: [f32; 3],
 }
+
+/// Glow around a light's line: (width in pixels at a 420-pixel-high view, additive strength).
+const BEAM_GLOW: [(f32, f32); 3] = [(26.0, 0.06), (12.0, 0.16), (5.0, 0.4)];
+const BEAM_CORE: f32 = 2.0;
+
+/// Haze: the lights' color added over the frame, stronger at the top (top, bottom strength).
+const HAZE: (f32, f32) = (0.16, 0.04);
 
 struct Frame {
     tris: Vec<Tri>,
     beams: Vec<Beam>,
+    /// The lights' average color: tints the dark geometry and the haze.
+    ambient: [f32; 3],
 }
 
 fn rgba(c: [f32; 3], a: f32) -> Color32 {
     let [r, g, b] = c.map(|v| (v.clamp(0.0, 1.0) * 255.0) as u8);
     Color32::from_rgba_unmultiplied(r, g, b, (a.clamp(0.0, 1.0) * 255.0) as u8)
+}
+
+/// Added on top of what is behind it (premultiplied with zero alpha), like bloom.
+fn additive(c: [f32; 3], strength: f32) -> Color32 {
+    let [r, g, b] = c.map(|v| ((v * strength).clamp(0.0, 1.0) * 255.0) as u8);
+    Color32::from_rgba_premultiplied(r, g, b, 0)
+}
+
+fn is_on(c: [f32; 3]) -> bool {
+    c.iter().any(|v| *v > 0.02)
+}
+
+/// A lit light's surface: its color with a hot, whiter core, as ChroMapper's bloom shows it.
+fn lit_surface(c: [f32; 3]) -> Color32 {
+    let m = c.iter().copied().fold(0.0, f32::max).min(1.0);
+    rgba(c.map(|v| (v * 1.25 + 0.35 * m).min(1.0)), 1.0)
+}
+
+/// Unlit geometry: ChroMapper's environment materials are nearly black, picking up a little of the
+/// lights' color.
+fn dark_surface(color: [f32; 4], n: V3, sun: V3, ambient: [f32; 3]) -> Color32 {
+    let lum = (color[0] + color[1] + color[2]) / 3.0;
+    let direct = 0.05 + 0.10 * dot(n, sun).abs();
+    let fill = 0.35 + 0.65 * n[1].abs().max(n[2].abs());
+    rgba(std::array::from_fn(|i| color[i] * direct + ambient[i] * 0.45 * fill * (0.4 + lum)), 1.0)
 }
 
 /// Builds the depth-sorted triangles for one frame.
@@ -251,6 +285,19 @@ fn build(
     let center = rect.center();
     let near = 0.1;
     let sun = norm([0.4, 1.0, -0.6]);
+    let env_objects = env.map(|e| e.objects.as_slice()).unwrap_or_default();
+    let env_lit: Vec<Option<[f32; 3]>> =
+        env_objects.iter().map(|o| o.light.as_ref().map(|(lane, ids)| light_rgb(*lane, ids))).collect();
+    let ambient = {
+        let mut sum = [0.0f32; 3];
+        let lit: Vec<[f32; 3]> = env_lit.iter().flatten().copied().collect();
+        for c in &lit {
+            for k in 0..3 {
+                sum[k] += c[k].min(1.0);
+            }
+        }
+        sum.map(|v| (v / lit.len().max(1) as f32).min(1.0))
+    };
 
     let to_view = |p: V3| {
         let d = sub(p, cam.pos);
@@ -272,7 +319,7 @@ fn build(
         } else if vb[2] < near {
             vb = clip(vb, va);
         }
-        beams.push(Beam { a: proj(va), b: proj(vb), color: rgba(c, 1.0) });
+        beams.push(Beam { a: proj(va), b: proj(vb), color: c });
     };
     let mut tris = Vec::new();
     let mut push = |world: [V3; 3], color: Color32, bias: f32| {
@@ -309,19 +356,15 @@ fn build(
         for t in mesh(o.prim) {
             let w = t.map(|v| to_world(v, 0.0));
             let color = match (o.emissive, lit) {
-                (true, Some(c)) if c.iter().any(|v| *v > 0.02) => rgba(c, 0.95),
-                (true, Some(_)) => Color32::from_rgb(14, 14, 18),
+                (true, Some(c)) if is_on(c) => lit_surface(c),
+                (true, Some(_)) => Color32::from_rgb(10, 10, 13),
                 (true, None) => rgba([o.color[0], o.color[1], o.color[2]], o.color[3]),
-                (false, _) => {
-                    let n = norm(cross(sub(w[1], w[0]), sub(w[2], w[0])));
-                    let shade = 0.25 + 0.5 * dot(n, sun).abs();
-                    rgba(o.color.map(|c| c * shade * 0.6)[..3].try_into().unwrap_or([0.0; 3]), o.color[3])
-                }
+                (false, _) => dark_surface(o.color, norm(cross(sub(w[1], w[0]), sub(w[2], w[0]))), sun, ambient),
             };
             push(w, color, 0.0);
         }
         // Long thin lit cubes also get a glowing line along their length.
-        if let Some(c) = lit.filter(|c| c.iter().any(|v| *v > 0.02) && o.prim == Prim::Cube) {
+        if let Some(c) = lit.filter(|c| is_on(*c) && o.prim == Prim::Cube) {
             let (mut axis, mut long) = (0, scale[0].abs());
             for k in 1..3 {
                 if scale[k].abs() > long {
@@ -337,25 +380,25 @@ fn build(
             }
         }
         // Bloom halo: a slightly larger, faint copy behind lit lights.
-        if let Some(c) = lit.filter(|c| c.iter().any(|v| *v > 0.02)) {
-            let grow = 0.35;
-            for t in mesh(o.prim) {
-                push(t.map(|v| to_world(v, grow)), rgba(c, 0.16), 0.05);
+        if let Some(c) = lit.filter(|c| is_on(*c)) {
+            for (grow, strength) in [(0.15, 0.22), (0.4, 0.10)] {
+                for t in mesh(o.prim) {
+                    push(t.map(|v| to_world(v, grow)), additive(c, strength), 0.05);
+                }
             }
         }
     }
     // Imported base environment: static world-space triangles.
-    for o in env.map(|e| e.objects.as_slice()).unwrap_or_default() {
+    for (o, lit) in env_objects.iter().zip(&env_lit) {
         let tri_at = |i: usize| -> [V3; 3] {
             let t = &o.tris[i * 9..i * 9 + 9];
             [[t[0], t[1], t[2]], [t[3], t[4], t[5]], [t[6], t[7], t[8]]]
         };
         let n_tris = o.tris.len() / 9;
-        match &o.light {
-            Some((lane, ids)) => {
-                let c = light_rgb(*lane, ids);
-                let on = c.iter().any(|v| *v > 0.02);
-                let color = if on { rgba(c, 0.95) } else { Color32::from_rgb(14, 14, 18) };
+        match *lit {
+            Some(c) => {
+                let on = is_on(c);
+                let color = if on { lit_surface(c) } else { Color32::from_rgb(10, 10, 13) };
                 for i in 0..n_tris {
                     push(tri_at(i), color, 0.0);
                 }
@@ -371,10 +414,15 @@ fn build(
                     }
                     let n = (o.tris.len() / 3).max(1) as f32;
                     let centre = centre.map(|c| c / n);
-                    let halo = rgba(c, 0.16);
-                    for i in 0..n_tris {
-                        let t = tri_at(i).map(|v| std::array::from_fn(|k| centre[k] + (v[k] - centre[k]) * 1.08));
-                        push(t, halo, 0.05);
+                    // Lights without a glow line get a soft additive halo around them.
+                    if o.beam.is_none() {
+                        for (grow, strength) in [(1.15, 0.22), (1.5, 0.08)] {
+                            for i in 0..n_tris {
+                                let t = tri_at(i)
+                                    .map(|v| std::array::from_fn(|k| centre[k] + (v[k] - centre[k]) * grow));
+                                push(t, additive(c, strength), 0.05);
+                            }
+                        }
                     }
                 }
             }
@@ -382,15 +430,13 @@ fn build(
                 for i in 0..n_tris {
                     let w = tri_at(i);
                     let n = norm(cross(sub(w[1], w[0]), sub(w[2], w[0])));
-                    let shade = 0.25 + 0.5 * dot(n, sun).abs();
-                    let c = [o.color[0], o.color[1], o.color[2]].map(|c| c * shade * 0.8);
-                    push(w, rgba(c, 1.0), 0.0);
+                    push(w, dark_surface(o.color, n, sun, ambient), 0.0);
                 }
             }
         }
     }
     tris.sort_by(|a, b| b.depth.total_cmp(&a.depth));
-    Frame { tris, beams }
+    Frame { tris, beams, ambient }
 }
 
 /// Number of triangles a frame produces; used by the map checker.
@@ -416,7 +462,23 @@ pub fn paint(
     cam: &Camera,
 ) {
     painter.rect_filled(rect, 0.0, Color32::from_rgb(4, 4, 8));
-    let Frame { tris, beams } = build(objects, env, beat, light_rgb, cam, rect);
+    paint_frame(painter, rect, build(objects, env, beat, light_rgb, cam, rect), true);
+}
+
+/// Objects only, over what is already drawn (Chroma geometry over the GPU-rendered environment).
+pub fn paint_overlay(
+    painter: &Painter,
+    rect: Rect,
+    objects: &[(&Obj, &Scene)],
+    beat: f64,
+    light_rgb: &dyn Fn(i64, &[i64]) -> [f32; 3],
+    cam: &Camera,
+) {
+    paint_frame(painter, rect, build(objects, None, beat, light_rgb, cam, rect), false);
+}
+
+fn paint_frame(painter: &Painter, rect: Rect, frame: Frame, with_haze: bool) {
+    let Frame { tris, beams, ambient } = frame;
     // egui meshes use 32-bit indices; split very large frames anyway to keep buffers modest.
     for chunk in tris.chunks(60_000) {
         let mut m = Mesh::default();
@@ -429,10 +491,23 @@ pub fn paint(
         }
         painter.add(Shape::mesh(m));
     }
+    if with_haze {
+    let mut haze = Mesh::default();
+    let (top, bottom) = (additive(ambient, HAZE.0), additive(ambient, HAZE.1));
+    haze.colored_vertex(rect.left_top(), top);
+    haze.colored_vertex(rect.right_top(), top);
+    haze.colored_vertex(rect.right_bottom(), bottom);
+    haze.colored_vertex(rect.left_bottom(), bottom);
+    haze.add_triangle(0, 1, 2);
+    haze.add_triangle(0, 2, 3);
+    painter.add(Shape::mesh(haze));
+    }
+    let k = rect.height() / 420.0;
     for b in &beams {
-        let glow = Color32::from_rgba_unmultiplied(b.color.r(), b.color.g(), b.color.b(), 45);
-        painter.line_segment([b.a, b.b], eframe::egui::Stroke::new(7.0, glow));
-        painter.line_segment([b.a, b.b], eframe::egui::Stroke::new(2.2, b.color));
+        for (w, strength) in BEAM_GLOW {
+            painter.line_segment([b.a, b.b], eframe::egui::Stroke::new(w * k, additive(b.color, strength)));
+        }
+        painter.line_segment([b.a, b.b], eframe::egui::Stroke::new(BEAM_CORE * k, lit_surface(b.color)));
     }
 }
 
@@ -457,6 +532,7 @@ pub fn render_rgb(
         if area.abs() < 1e-6 {
             continue;
         }
+        // Color32 is premultiplied: zero alpha adds.
         let alpha = f32::from(t.color.a()) / 255.0;
         let col = [t.color.r(), t.color.g(), t.color.b()].map(f32::from);
         for y in y0..y1 {
@@ -466,24 +542,46 @@ pub fn render_rgb(
                 if e(a, b) >= 0.0 && e(b, c) >= 0.0 && e(c, a) >= 0.0 {
                     let px = &mut img[y * w + x];
                     for i in 0..3 {
-                        px[i] = px[i] * (1.0 - alpha) + col[i] * alpha;
+                        px[i] = px[i] * (1.0 - alpha) + col[i];
                     }
                 }
             }
         }
     }
+    for y in 0..h {
+        let t = y as f32 / h.max(1) as f32;
+        let s = HAZE.0 + (HAZE.1 - HAZE.0) * t;
+        for px in &mut img[y * w..(y + 1) * w] {
+            for i in 0..3 {
+                px[i] += frame.ambient[i] * s * 255.0;
+            }
+        }
+    }
+    let k = h as f32 / 420.0;
     for b in &frame.beams {
-        let col = [b.color.r(), b.color.g(), b.color.b()].map(f32::from);
-        let steps = (b.b - b.a).length().ceil().clamp(1.0, 4000.0) as usize;
-        for s in 0..=steps {
-            let p = b.a + (b.b - b.a) * (s as f32 / steps as f32);
-            for (dx, dy, alpha) in [(0, 0, 1.0), (1, 0, 0.6), (0, 1, 0.6), (-1, 0, 0.6), (0, -1, 0.6)] {
-                let (x, y) = (p.x as i64 + dx, p.y as i64 + dy);
-                if x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h {
-                    let px = &mut img[y as usize * w + x as usize];
-                    for i in 0..3 {
-                        px[i] = px[i] * (1.0 - alpha) + col[i] * alpha;
+        let (d, len2) = (b.b - b.a, (b.b - b.a).length_sq().max(1e-6));
+        let r = BEAM_GLOW[0].0 * k / 2.0;
+        let (x0, x1) = ((b.a.x.min(b.b.x) - r).max(0.0) as usize, ((b.a.x.max(b.b.x) + r).ceil() as usize).min(w));
+        let (y0, y1) = ((b.a.y.min(b.b.y) - r).max(0.0) as usize, ((b.a.y.max(b.b.y) + r).ceil() as usize).min(h));
+        let core = lit_surface(b.color);
+        let core = [core.r(), core.g(), core.b()].map(f32::from);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let p = Pos2::new(x as f32 + 0.5, y as f32 + 0.5);
+                let t = ((p - b.a).dot(d) / len2).clamp(0.0, 1.0);
+                let dist = (p - (b.a + d * t)).length();
+                let px = &mut img[y * w + x];
+                for (gw, strength) in BEAM_GLOW {
+                    let half = gw * k / 2.0;
+                    if dist < half {
+                        let f = 1.0 - dist / half;
+                        for i in 0..3 {
+                            px[i] += b.color[i].min(1.0) * strength * f * 255.0;
+                        }
                     }
+                }
+                if dist < BEAM_CORE * k / 2.0 {
+                    *px = core;
                 }
             }
         }

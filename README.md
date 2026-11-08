@@ -33,24 +33,28 @@ The folder is the one containing `Info.dat`. The last folder is remembered.
 The **Preview** panel at the bottom (toggle in the toolbar, drag its edge to resize) is a 3D
 view from the player's spot at the playhead:
 
-- **Base environment from ChroMapper**: run `tools/import-chromapper-envs.sh` once. It fetches
-  ChroMapper's environment recreations (its prefabs, meshes and materials) and converts them,
-  with ChroMapper's light IDs, ring copies and environment colors. The preview then shows the
-  map's environment ("Environment: Triangle (ChroMapper)") lit by your events. Rings and lasers
-  stay in their resting positions (ring spin/zoom and laser speed aren't animated yet).
-  ChroMapper doesn't have the newer environments (Weave, Pyro, The Weeknd, Rock Mixtape, …) or
-  Green Day; those maps, and any map before you import, fall back to a generic stand-in stage.
-- **Custom geometry from the map is exact**: Chroma `environment` objects (cubes, spheres,
-  cylinders, planes, quads, triangles) with their materials, lit by your light events through
-  their `ILightWithId` lane and light ID, and moved by `AnimateTrack` (position, rotation,
-  scale, easings, repeat, point definitions).
-- Not previewed: edits that move base-game objects, Vivify events (those need Unity; see
-  ChroMapper-PropPreview), track parenting. Bloom is approximated with glowing lines.
+- **Environments from your ChroMapper**: run `tools/export-chromapper-envs.sh` once (podman,
+  dotnet and ChroMapper-PropPreview needed). It opens every environment in your installed
+  ChroMapper (headless, in a container) and exports its meshes, materials, textures, light IDs,
+  light components, fog lights and particles.
+- **Rendered like ChroMapper**: the preview is a GPU port of ChroMapper's BloomFog rendering:
+  light quads blurred into the fog texture (exposure knee and ACES), fog and height fog on every
+  surface and the sky, ChroMapper's lit surfaces with its five environment lights, light tubes,
+  fake glows, smoke and dust particles, mirror reflections, and the post bloom. Light colors come
+  from the editor's ChroMapper-exact light model. Rotating lasers follow the laser-speed events
+  (start angles are random in ChroMapper, so they differ).
+- **Custom geometry from the map**: Chroma `environment` objects (cubes, spheres, cylinders,
+  planes, quads, triangles) lit by your events and moved by `AnimateTrack`. They are drawn over the
+  environment, not yet depth-tested against it.
+- Not previewed yet: ring spin and zoom, audio-driven spectrograms, Lit emission textures and the
+  glow-sprite and lightmap features some newer environments use, edits that move base-game
+  objects, Vivify, track parenting. Without exported environments the preview falls back to a
+  simple stand-in renderer.
 
 Drag to look around, use the wheel to move, double-click to reset the camera.
 
-ChroMapper is GPL-2.0, so its source and the converted environments are kept in
-`~/.local/share/bs-light-timeline/`, not in this repository.
+The exported environments are kept in `~/.local/share/bs-light-timeline/environments/`, not in
+this repository.
 
 Key shapes: ◆ On, ● Transition, ▲ Flash, ▼ Fade, ■ Off. A **Transition** key is blended into
 from the key before it, and that earlier key's "Easing to next" sets the curve (this is how the
@@ -82,3 +86,25 @@ cargo build --release && test/run-ui-test.sh "/path/to/CustomLevels" /tmp/bslt-u
 Runs the real app on Xvfb inside a podman container (`test/Containerfile`) with the maps
 mounted read-only, drives it with xdotool (`test/ui-steps.sh`: add, recolor, slider, save,
 delete, undo) on a copy of one map, and writes screenshots to the output folder.
+
+## Comparing with ChroMapper
+
+```bash
+test/compare-chromapper.sh <jobs.tsv> "/path/to/CustomLevels" test/out/all 2
+cargo run --release -- --compare-lights "/path/to/CustomLevels" <jobs.tsv> test/out/all
+```
+
+Opens each map in your ChroMapper inside podman (memory and CPU capped; see the script) with the
+probe plugin in `test/chromapper-probe`, records every light's color at a few beats, and compares
+them with the editor's light model. `--plan-compare` writes a jobs file for a CustomLevels folder.
+
+With `PROBE_FULL=1 CM_HIDE_NOTES=1` the probe also records the renderer state (shader globals, fog
+lights, light blocks, particles, transforms, ChroMapper's fog texture). Then
+
+```bash
+cargo run --release -- --render-ref test/out/ref/<job>
+python3 -I test/refcmp.py test/out/ref/<job>
+```
+
+renders each snapshot with ChroMapper's recorded light state and writes side-by-side images with
+the mean error (`BSLT_FROM_LIGHTS=1` derives the shader inputs from the light colors instead).

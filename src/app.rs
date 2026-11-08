@@ -136,6 +136,16 @@ pub struct App {
     env_colors: map::MapColors,
     /// Widgets that take typed text; shortcuts are off only while one of these has focus.
     text_inputs: Vec<egui::Id>,
+    /// GPU renderer (ChroMapper's BloomFog port) for environments exported with meshes.
+    gpu: Option<crate::gpu3d::Gpu3d>,
+    wgpu: Option<eframe::egui_wgpu::RenderState>,
+    gpu_texture: Option<(egui::TextureId, (u32, u32))>,
+    env_lights: Option<crate::envscene::EnvLights>,
+    env_components: Vec<serde_json::Value>,
+    /// Rotating lasers and lights from the map's events.
+    motion: crate::motion::Motion,
+    /// Draw the environment with the GPU renderer (else the simple one).
+    use_gpu: bool,
 }
 
 fn last_path_file() -> Option<PathBuf> {
@@ -228,7 +238,7 @@ fn draw_key(p: &Painter, c: Pos2, k: &Key, selected: bool, r: f32) {
 }
 
 impl App {
-    pub fn new(path: Option<String>) -> Self {
+    pub fn new(path: Option<String>, wgpu: Option<eframe::egui_wgpu::RenderState>) -> Self {
         let remembered = last_path_file()
             .and_then(|f| std::fs::read_to_string(f).ok())
             .map(|s| s.trim().to_owned());
@@ -277,6 +287,13 @@ impl App {
             rows_gen: 1,
             model_gen: 0,
             env_colors: map::MapColors::default(),
+            gpu: wgpu.as_ref().map(|w| crate::gpu3d::Gpu3d::new(w.device.clone(), w.queue.clone())),
+            wgpu,
+            gpu_texture: None,
+            env_lights: None,
+            env_components: Vec::new(),
+            motion: Default::default(),
+            use_gpu: true,
             text_inputs: Vec::new(),
         };
         if !app.path_input.is_empty() {
@@ -343,6 +360,18 @@ impl App {
                 } else {
                     view3d::base_stage(&self.preview_lights, &bm.rows, &self.scene)
                 };
+                // The renderer's data: textures and light components next to the environment file.
+                self.env_lights = None;
+                self.env_components.clear();
+                if let (Some(e), Some(dir)) = (&env, crate::environment::extras_dir(&env_name)) {
+                    if !e.meshes.is_empty() {
+                        self.env_lights = Some(crate::envscene::EnvLights::load(e, &dir));
+                        self.env_components = crate::envscene::EnvLights::components(&dir);
+                        if let Some(g) = &mut self.gpu {
+                            g.set_environment(e, Some(&dir.join("textures")));
+                        }
+                    }
+                }
                 self.env = env;
                 self.env_name = env_name;
                 self.env_colors = d.colors;
@@ -392,6 +421,11 @@ impl App {
         self.model = self.beatmap.as_ref().map(|bm| {
             LightModel::build(bm, self.env.as_ref(), &self.env_colors, bpm)
         });
+        self.motion = self
+            .beatmap
+            .as_ref()
+            .map(|bm| crate::motion::Motion::new(&self.env_components, &bm.json, bpm))
+            .unwrap_or_default();
     }
 
     fn light_rgb(&self, row: &Row, beat: f64) -> [f32; 3] {
@@ -1621,6 +1655,42 @@ impl App {
         }
         objs.extend(self.scene.objects.iter().map(|o| (o, &self.scene)));
         let env = self.env.as_ref().filter(|_| self.show_base);
+        let seconds = (beat * 60.0 / self.bpm()) as f32;
+        if let (true, Some(e), Some(el), Some(gpu), Some(rs)) = (self.use_gpu, env, &self.env_lights, &mut self.gpu, &self.wgpu) {
+            let ppp = ui.ctx().pixels_per_point();
+            let (w, h) = (((rect.width() * ppp) as u32).max(1), ((rect.height() * ppp) as u32).max(1));
+            let state = el.state_at(e, &|k| model.map_or([0.0; 4], |m| m.color_keys(k.0, &k.1, beat)), &self.motion, seconds);
+            let fog = e.fog.unwrap_or(crate::environment::FogParams {
+                offset: 0.0,
+                height: 25.0,
+                start_y: -50.0,
+                attenuation: 0.002,
+                auto_exposure_limit: 1000.0,
+                legacy_auto_exposure: false,
+            });
+            let view = crate::gpu3d::View::from_camera(&self.camera, e.unit);
+            gpu.set_environment(e, None);
+            let out = gpu.render(&crate::gpu3d::Frame { view, width: w, height: h, env: e, state: &state, fog, post_bloom: true });
+            let tv = out.create_view(&Default::default());
+            let mut r = rs.renderer.write();
+            let id = match self.gpu_texture {
+                Some((id, size)) if size == (w, h) => id,
+                Some((id, _)) => {
+                    r.update_egui_texture_from_wgpu_texture(&rs.device, &tv, eframe::wgpu::FilterMode::Linear, id);
+                    id
+                }
+                None => r.register_native_texture(&rs.device, &tv, eframe::wgpu::FilterMode::Linear),
+            };
+            self.gpu_texture = Some((id, (w, h)));
+            drop(r);
+            painter.image(id, rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+            // Chroma custom geometry: the simple renderer, on top (no depth against the environment yet).
+            if !objs.is_empty() {
+                view3d::paint_overlay(&painter, rect, &objs, beat, &light, &self.camera);
+            }
+            ui.ctx().request_repaint();
+            return;
+        }
         view3d::paint(&painter, rect, &objs, env, beat, &light, &self.camera);
     }
 

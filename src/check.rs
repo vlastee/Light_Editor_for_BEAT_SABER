@@ -370,6 +370,34 @@ pub fn render(folder: &Path, diff: &str, beats: &str, out: &Path, pose: Option<&
         let model = crate::cmlight::LightModel::build(&bm, env.as_ref(), &d.colors, info.bpm);
         std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
         let (w, h) = (1280, 420);
+        // The GPU renderer when the environment was exported with its renderer data (as the editor).
+        let gpu_env = env.as_ref().filter(|e| !e.meshes.is_empty()).zip(crate::environment::extras_dir(&d.environment));
+        if let Some((e, dir)) = gpu_env.filter(|_| std::env::var_os("BSLT_SOFTWARE").is_none()) {
+            let lights = crate::envscene::EnvLights::load(e, &dir);
+            let motion = crate::motion::Motion::new(&crate::envscene::EnvLights::components(&dir), &bm.json, info.bpm);
+            let mut gpu = crate::gpu3d::Gpu3d::headless()?;
+            gpu.set_environment(e, Some(&dir.join("textures")));
+            let view = match pose {
+                Some(p) => crate::gpu3d::View::from_pose(p).ok_or("bad pose")?,
+                None => crate::gpu3d::View::from_camera(&cam, e.unit),
+            };
+            let fog = e.fog.unwrap_or(crate::environment::FogParams {
+                offset: 0.0,
+                height: 25.0,
+                start_y: -50.0,
+                attenuation: 0.002,
+                auto_exposure_limit: 1000.0,
+                legacy_auto_exposure: false,
+            });
+            for b in beats.split(',').filter_map(|b| b.trim().parse::<f64>().ok()) {
+                let seconds = (b * 60.0 / info.bpm) as f32;
+                let state = lights.state_at(e, &|k| model.color_keys(k.0, &k.1, b), &motion, seconds);
+                gpu.render(&crate::gpu3d::Frame { view, width: w as u32, height: h as u32, env: e, state: &state, fog, post_bloom: true });
+                crate::gpu3d::write_png(&out.join(format!("{b}.png")), w as u32, h as u32, &gpu.read_rgb())?;
+            }
+            println!("{} · {} · env {} (GPU)", d.name, beats, d.environment);
+            return Ok(());
+        }
         for b in beats.split(',').filter_map(|b| b.trim().parse::<f64>().ok()) {
             let light = |lane: i64, ids: &[i64]| model.rgb_keys(lane, ids, b);
             let px = crate::view3d::render_rgb(&objs, env.as_ref(), b, &light, &cam, w, h);

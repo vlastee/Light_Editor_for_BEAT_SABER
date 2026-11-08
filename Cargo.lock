@@ -524,7 +524,10 @@ dependencies = [
 name = "bs-light-timeline"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "eframe",
+ "png",
+ "pollster",
  "rodio",
  "serde_json",
 ]

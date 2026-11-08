@@ -12,6 +12,8 @@
 # jobs.tsv lines: name<TAB>map folder (inside /maps)<TAB>difficulty<TAB>beats csv
 # Per job, <out>/<name>/ gets environment.json, lights.jsonl and <beat>.png pose renders.
 # Your ChroMapper settings are copied into each container; the real ones are not touched.
+# CM_HIDE_NOTES=1 hides notes and walls (for comparing environment renders); PROBE_FULL=1 also exports
+# components, textures and per-snapshot shader state (for the renderer port).
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 jobs=$1; maps=$2; out=$3; par=${4:-2}
@@ -40,9 +42,11 @@ i=0
 for part in "$run"/jobs.*; do
     home="$run/home$i"; rm -rf "$home"; mkdir -p "$home/.config/unity3d/BinaryElement/ChroMapper"
     python3 -I - "$cfg/ChroMapperSettings.json" "$home/.config/unity3d/BinaryElement/ChroMapper/ChroMapperSettings.json" <<'PY'
-import json, sys
+import json, os, sys
 s = json.load(open(sys.argv[1]))
 s.update(BeatSaberInstallation="/bs", LastLoadedMap="", DiscordRPCEnabled="False")
+if os.environ.get("CM_HIDE_NOTES"):  # reference renders of the environment alone
+    s.update(Load_Notes="False", Load_Obstacles="False")
 json.dump(s, open(sys.argv[2], "w"), indent=2)
 PY
     podman rm -f "bslt-cmp$i" >/dev/null 2>&1 || true
@@ -50,7 +54,7 @@ PY
         --cpus "${CM_CPUS:-4}" -e LP_NUM_THREADS="${CM_CPUS:-4}" \
         -v "$cm:/cm:ro,Z" -v "$run/plugins:/cm/Plugins:ro,Z" -v "$maps:/maps:ro" \
         -v "$out:/out:Z" -v "$home:/tmp/home:Z" -v "$here:/test:ro,Z" -v "$part:/jobs.tsv:ro,Z" \
-        -e HOME=/tmp/home -e DISPLAY=:99 localhost/bs-light-timeline-cm sh /test/cm-worker.sh /jobs.tsv >/dev/null
+        -e PROBE_FULL="${PROBE_FULL:-}" -e HOME=/tmp/home -e DISPLAY=:99 localhost/bs-light-timeline-cm sh /test/cm-worker.sh /jobs.tsv >/dev/null
     i=$((i + 1))
 done
 for c in $(seq 0 $((i - 1))); do podman wait "bslt-cmp$c" >/dev/null; podman logs "bslt-cmp$c" > "$run/worker$c.log" 2>&1; podman rm "bslt-cmp$c" >/dev/null; done

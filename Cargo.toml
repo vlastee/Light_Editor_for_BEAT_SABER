@@ -7,3 +7,6 @@ edition = "2024"
 eframe = "0.37.0"
 rodio = { version = "0.20", default-features = false, features = ["vorbis", "wav"] }
 serde_json = { version = "1.0.154", features = ["preserve_order", "float_roundtrip"] }
+bytemuck = { version = "1.25", features = ["derive"] }
+pollster = "1.0"
+png = "0.18"

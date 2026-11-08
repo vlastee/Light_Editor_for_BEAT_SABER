@@ -3,9 +3,13 @@ mod audio;
 mod check;
 mod cmlight;
 mod environment;
+mod envscene;
 mod eval;
+mod gpu3d;
 mod map;
+mod motion;
 mod preview;
+mod refrender;
 mod scene;
 mod view3d;
 
@@ -40,6 +44,9 @@ fn main() -> eframe::Result {
             args.get(5).map(String::as_str),
         ));
     }
+    if args.first().map(String::as_str) == Some("--render-ref") && args.len() >= 2 {
+        std::process::exit(refrender::run(std::path::Path::new(&args[1]), args.get(2).map(String::as_str)));
+    }
     if args.first().map(String::as_str) == Some("--plan-compare") && args.len() >= 3 {
         std::process::exit(check::plan_compare(std::path::Path::new(&args[1]), std::path::Path::new(&args[2])));
     }
@@ -60,6 +67,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Beat Saber Light Timeline",
         options,
-        Box::new(|_cc| Ok(Box::new(app::App::new(map_folder)))),
+        Box::new(|cc| Ok(Box::new(app::App::new(map_folder, cc.wgpu_render_state.clone())))),
     )
 }

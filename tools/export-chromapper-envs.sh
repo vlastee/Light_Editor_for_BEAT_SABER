@@ -2,7 +2,8 @@
 # Exports every environment from your installed ChroMapper (native Linux build) for the preview:
 # for each environment it generates a tiny map, opens it in ChroMapper inside podman (Xvfb,
 # software OpenGL; see test/compare-chromapper.sh) with the BslProbe plugin, and saves the
-# loaded scene's meshes, lights (lane + map light ID), lane settings and colors.
+# loaded scene's meshes, materials, textures, lights (lane + map light IDs), particle systems, fog
+# lights, lane settings and colors, for the editor's renderer (a port of ChroMapper's BloomFog).
 # Needs podman, dotnet (to build the probe) and ChroMapper-PropPreview in ChroMapper's Plugins.
 # The results stay in ~/.local/share/bs-light-timeline/environments (ChroMapper is GPL-2.0).
 set -eu
@@ -35,6 +36,7 @@ open(os.path.join(work, "jobs.tsv"), "w").write("\n".join(jobs) + "\n")
 PY
 }
 # First run: DefaultEnvironment, which also lists every environment this ChroMapper has.
+export PROBE_FULL=1
 gen DefaultEnvironment
 "$here/test/compare-chromapper.sh" "$work/jobs.tsv" "$work/maps" "$work/out" 1
 envs=$(grep -v '^DefaultEnvironment$' "$work/out/env_DefaultEnvironment/environments.txt" || true)
@@ -46,6 +48,12 @@ fi
 n=0
 for d in "$work"/out/env_*; do
     [ -f "$d/environment.json" ] || continue
-    cp "$d/environment.json" "$data/environments/${d##*/env_}.json"; n=$((n + 1))
+    name=${d##*/env_}
+    cp "$d/environment.json" "$data/environments/$name.json"
+    # Extras next to it: fog lights, component settings and textures.
+    rm -rf "$data/environments/$name"; mkdir -p "$data/environments/$name"
+    for f in bloomfog.json components.json; do [ -f "$d/$f" ] && cp "$d/$f" "$data/environments/$name/"; done
+    [ -d "$d/textures" ] && cp -r "$d/textures" "$data/environments/$name/"
+    n=$((n + 1))
 done
 echo "Exported $n environments to $data/environments"
