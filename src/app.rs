@@ -7,12 +7,12 @@ use crate::cmlight::LightModel;
 use crate::environment::EnvFile;
 use crate::scene::{Obj, Scene};
 use crate::view3d::{self, Camera};
-use crate::map::{self, Base, Beatmap, Key, Kind, LoadedMap, Row};
+use crate::map::{self, Base, Beatmap, Key, Kind, LoadedMap, Row, RowKind};
 use eframe::egui::{
     self, Align2, Color32, FontId, Painter, PointerButton, Pos2, Rect, Sense, Shape, Stroke,
     StrokeKind, Vec2,
 };
-use serde_json::Map;
+use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -62,11 +62,24 @@ enum Change {
     Brightness(f32),
     Easing(Option<String>),
     Hsv(bool),
+    /// A Position key's offset along one axis.
+    Axis(usize, f32),
 }
 
 impl Change {
     fn apply(&self, k: &mut Key) {
+        // Position keys have no light fields, light keys no offset.
+        match (self, &mut k.pos) {
+            (Change::Axis(a, v), Some(p)) => {
+                p[*a] = *v;
+                return;
+            }
+            (Change::Axis(..), None) => return,
+            (Change::Beat(_) | Change::Easing(_), _) | (_, None) => {}
+            (_, Some(_)) => return,
+        }
         match self {
+            Change::Axis(..) => {}
             Change::Beat(b) => k.beat = b.max(0.0),
             Change::Kind(v) => {
                 k.kind = *v;
@@ -122,6 +135,7 @@ pub struct App {
     new_kind: Kind,
     palette: Vec<[f32; 4]>,
     show_preview: bool,
+    highlight_lights: bool,
     preview_lights: Vec<LaneLights>,
     scene: Scene,
     base_objs: Vec<Obj>,
@@ -178,9 +192,17 @@ fn key_range(row: &Row, b0: f64, b1: f64) -> &[Key] {
     &row.keys[s..e]
 }
 
+/// Whether the map's Info.dat names Chroma (as a requirement or suggestion).
+fn lists_chroma(m: &LoadedMap) -> bool {
+    ["Info.dat", "info.dat"]
+        .iter()
+        .filter_map(|n| std::fs::read_to_string(m.folder.join(n)).ok())
+        .any(|t| t.contains("\"Chroma\""))
+}
+
 fn compute_palette(rows: &[Row]) -> Vec<[f32; 4]> {
     let mut counts: Vec<([f32; 4], usize)> = Vec::new();
-    for c in rows.iter().flat_map(|r| &r.keys).filter_map(|k| k.color) {
+    for c in rows.iter().filter(|r| r.is_light()).flat_map(|r| &r.keys).filter_map(|k| k.color) {
         let q = c.map(|v| (v * 50.0).round() / 50.0);
         match counts.iter_mut().find(|(x, _)| *x == q) {
             Some(e) => e.1 += 1,
@@ -189,6 +211,40 @@ fn compute_palette(rows: &[Row]) -> Vec<[f32; 4]> {
     }
     counts.sort_by(|a, b| b.1.cmp(&a.1));
     counts.into_iter().take(18).map(|(c, _)| c).collect()
+}
+
+/// Lights picked out in the preview: per lane, either every light (`None`) or those reached by
+/// these map light IDs.
+#[derive(Default)]
+struct Highlight {
+    lanes: HashMap<i64, Option<HashSet<i64>>>,
+}
+
+impl Highlight {
+    fn add(&mut self, row: &Row) {
+        let ids: Option<HashSet<i64>> = match &row.light_ids {
+            Some(Value::Array(a)) if !a.is_empty() => Some(a.iter().filter_map(Value::as_i64).collect()),
+            Some(v) => v.as_i64().map(|i| HashSet::from([i])),
+            None => None,
+        };
+        match (self.lanes.entry(row.lane).or_insert_with(|| Some(HashSet::new())), ids) {
+            (Some(have), Some(ids)) => have.extend(ids),
+            (entry, _) => *entry = None,
+        }
+    }
+
+    fn matches(&self, lane: i64, ids: &[i64]) -> bool {
+        match self.lanes.get(&lane) {
+            None => false,
+            Some(None) => true,
+            Some(Some(set)) => ids.iter().any(|i| set.contains(i)),
+        }
+    }
+
+    /// For the simple renderer (custom geometry, the stand-in stage), which can't outline: solid white.
+    fn rgb(&self, lane: i64, ids: &[i64], c: [f32; 3]) -> [f32; 3] {
+        if self.matches(lane, ids) { [1.0; 3] } else { c }
+    }
 }
 
 fn draw_key(p: &Painter, c: Pos2, k: &Key, selected: bool, r: f32) {
@@ -276,6 +332,7 @@ impl App {
             new_kind: Kind::Transition,
             palette: Vec::new(),
             show_preview: true,
+            highlight_lights: false,
             preview_lights: Vec::new(),
             scene: Scene::default(),
             base_objs: Vec::new(),
@@ -400,9 +457,36 @@ impl App {
 
     fn save(&mut self) {
         if let Some(bm) = &mut self.beatmap {
+            let note = {
+                let targets = self.env_lights.as_ref().zip(self.env.as_ref()).map(|(el, e)| {
+                    let unit = e.unit;
+                    move |r: &Row| el.move_targets(r, unit)
+                });
+                let resolve = targets.as_ref().map(|f| f as &map::Resolve);
+                bm.write_positions(resolve)
+            };
+            let moves = bm.rows.iter().any(|r| !r.is_light() && !r.keys.is_empty());
+            // Aim lines can fight with laser-speed events that spin the same lasers.
+            let spinning = self.env_lights.as_ref().map_or(0, |el| {
+                let spb = 60.0 / self.map.as_ref().map_or(120.0, |m| m.bpm);
+                let at = |k: &Key| (k.beat * spb) as f32;
+                bm.rows
+                    .iter()
+                    .filter(|r| r.kind == RowKind::Aim && !r.keys.is_empty())
+                    .map(|r| el.spinning(r, &self.motion, at(&r.keys[0]), at(&r.keys[r.keys.len() - 1])))
+                    .sum::<usize>()
+            });
             match bm.save() {
                 Ok(msg) => {
-                    self.status = msg;
+                    // Warnings first: the backup path can run off the status bar.
+                    let mut warn = note.unwrap_or_default();
+                    if spinning > 0 {
+                        warn += &format!(" {spinning} aimed lasers also spin from laser-speed events: turn those off or the game may fight the aim.");
+                    }
+                    if moves && !self.map.as_ref().is_some_and(lists_chroma) {
+                        warn += " Add Chroma to the map's requirements or the lights won't move in the game.";
+                    }
+                    self.status = if warn.is_empty() { msg } else { format!("{}  ·  {msg}", warn.trim_start()) };
                     self.dirty = false;
                 }
                 Err(e) => self.status = e,
@@ -541,7 +625,11 @@ impl App {
         let id = self.next_id;
         let Some(bm) = &mut self.beatmap else { return };
         let row = &mut bm.rows[row_idx];
-        let key = match row.keys.iter().rev().find(|k| k.beat <= beat) {
+        let key = if !row.is_light() {
+            // Starts where the lights are at that moment, so adding a key doesn't move them.
+            let easing = row.keys.iter().rev().find(|k| k.beat <= beat).and_then(|k| k.easing.clone());
+            Key::line(row.kind, id, beat, row.position_at(beat), easing)
+        } else { match row.keys.iter().rev().find(|k| k.beat <= beat) {
             Some(prev) => Key {
                 id,
                 beat,
@@ -568,14 +656,45 @@ impl App {
                 lerp_hsv: false,
                 extra: Map::new(),
                 extra_custom: Map::new(),
+                pos: None,
             },
-        };
+        } };
         row.keys.push(key);
         row.sort();
         self.selected = HashSet::from([id]);
         self.active_row = Some(row_idx);
         self.dirty = true;
         self.rows_gen += 1;
+    }
+
+    /// The active light row, if it doesn't have a line of this kind yet.
+    fn line_target(&self, kind: RowKind) -> Option<usize> {
+        let rows = &self.beatmap.as_ref()?.rows;
+        let i = self.active_row?;
+        if !rows.get(i)?.is_light() {
+            return None;
+        }
+        (!rows[i + 1..].iter().take_while(|r| !r.is_light()).any(|r| r.kind == kind)).then_some(i)
+    }
+
+    fn add_line(&mut self, i: usize, kind: RowKind) {
+        self.push_undo();
+        let Some(bm) = &mut self.beatmap else { return };
+        let line = Row { lane: bm.rows[i].lane, light_ids: bm.rows[i].light_ids.clone(), keys: Vec::new(), kind };
+        let unit = self.env.as_ref().map_or(1.0, |e| e.unit);
+        let reach = self.env_lights.as_ref().map(|el| el.move_targets(&line, unit));
+        let at = map::line_slot(&bm.rows, i, kind);
+        let name = line.label();
+        bm.rows.insert(at, line);
+        self.active_row = Some(at);
+        // Row indices moved.
+        self.clipboard.clear();
+        self.rows_gen += 1;
+        self.status = match reach {
+            None => format!("{name} line added. Export this environment to preview it and write it for the game."),
+            Some((t, 0)) => format!("{name} line added: controls {} objects", t.len()),
+            Some((t, n)) => format!("{name} line added: controls {} objects; {n} lights share a name with others and can't be moved", t.len()),
+        };
     }
 
     fn delete_selected(&mut self) {
@@ -636,6 +755,7 @@ impl App {
                 .beatmap
                 .as_mut()
                 .and_then(|bm| bm.rows.get_mut(row_idx))
+                .filter(|row| !row.is_light() == key.pos.is_some())
             {
                 row.keys.push(key);
             }
@@ -1109,7 +1229,24 @@ impl App {
                         Pos2::new(tl.right(), l.y + l.h - 5.0),
                     );
                     rp.rect_filled(strip, 0.0, Color32::from_gray(14));
-                    if !row.keys.is_empty() {
+                    if !row.is_light() {
+                        // Bright while the lights move, dim while they hold.
+                        let (bright, dim) = if row.kind == RowKind::Aim {
+                            (Color32::from_rgb(200, 140, 60), Color32::from_rgb(85, 60, 30))
+                        } else {
+                            (Color32::from_rgb(70, 170, 185), Color32::from_rgb(30, 70, 80))
+                        };
+                        for (i, k) in row.keys.iter().enumerate() {
+                            let next = row.keys.get(i + 1);
+                            let moving = next.is_some_and(|n| n.pos != k.pos);
+                            let x1 = next.map_or(tl.right(), |n| self.beat_to_x(n.beat));
+                            let x0 = self.beat_to_x(k.beat).max(tl.left());
+                            if x1 > x0 {
+                                let c = if moving { bright } else { dim };
+                                rp.rect_filled(Rect::from_x_y_ranges(x0..=x1.min(tl.right()), strip.y_range()), 0.0, c);
+                            }
+                        }
+                    } else if !row.keys.is_empty() {
                         let mut x = tl.left();
                         let mut run: Option<(f32, Color32)> = None;
                         while x < tl.right() {
@@ -1180,7 +1317,7 @@ impl App {
             let cy = l.y + l.h / 2.0;
             match l.line {
                 Line::Lane(lane) => {
-                    let n = bm.rows.iter().filter(|r| r.lane == lane).count();
+                    let n = bm.rows.iter().filter(|r| r.lane == lane && r.is_light()).count();
                     let sign = if self.collapsed.contains(&lane) { "+" } else { "−" };
                     lp.text(
                         Pos2::new(full.left() + 8.0, cy),
@@ -1192,6 +1329,16 @@ impl App {
                 }
                 Line::Row(i) => {
                     let row = &bm.rows[i];
+                    if !row.is_light() {
+                        lp.text(
+                            Pos2::new(full.left() + 62.0, cy),
+                            Align2::LEFT_CENTER,
+                            format!("{}  [{}]", row.label(), row.keys.len()),
+                            font.clone(),
+                            if row.kind == RowKind::Aim { Color32::from_rgb(235, 185, 110) } else { Color32::from_rgb(120, 200, 210) },
+                        );
+                        continue;
+                    }
                     let sw = Rect::from_center_size(
                         Pos2::new(full.left() + 30.0, cy),
                         Vec2::splat(12.0),
@@ -1370,6 +1517,27 @@ impl App {
 
     fn properties_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Keyframe");
+        ui.checkbox(&mut self.highlight_lights, "Highlight in preview").on_hover_text(
+            "Outlines the lights of the selected keys' rows in white. \
+             With no key selected, uses the active row.",
+        );
+        ui.horizontal(|ui| {
+            for (kind, label, hover) in [
+                (RowKind::Position, "Add Position line", "Adds a line under the active light row, with keys that move its lights."),
+                (RowKind::Aim, "Add Aim line", "Adds a line under the active light row, with keys that turn its lights to point somewhere else."),
+            ] {
+                let target = self.line_target(kind);
+                if ui
+                    .add_enabled(target.is_some(), egui::Button::new(label))
+                    .on_hover_text(hover)
+                    .on_disabled_hover_text("Click a light row that doesn't have this line yet.")
+                    .clicked()
+                    && let Some(i) = target
+                {
+                    self.add_line(i, kind);
+                }
+            }
+        });
         ui.add_space(4.0);
         let template = self
             .selected
@@ -1444,6 +1612,40 @@ impl App {
                     changes.push(Change::Beat(b));
                 }
                 ui.end_row();
+            }
+
+            if let Some(p) = t.pos {
+                let aim = self.beatmap.as_ref().is_some_and(|bm| {
+                    bm.rows.iter().any(|r| r.kind == RowKind::Aim && r.keys.iter().any(|k| k.id == t.id))
+                });
+                let (names, speed, unit) = if aim {
+                    (["X (tilt down)", "Y (turn right)", "Z (roll)"], 0.5, "°")
+                } else {
+                    (["X (right)", "Y (up)", "Z (forward)"], 0.02, " m")
+                };
+                for (axis, name) in names.into_iter().enumerate() {
+                    ui.label(name);
+                    let mut v = p[axis];
+                    let r = ui.add(egui::DragValue::new(&mut v).speed(speed).suffix(unit));
+                    self.text_inputs.push(r.id);
+                    if r.changed() {
+                        changes.push(Change::Axis(axis, v));
+                    }
+                    ui.end_row();
+                }
+                ui.label("Easing to next");
+                egui::ComboBox::from_id_salt("pos easing")
+                    .selected_text(t.easing.as_deref().unwrap_or("easeLinear"))
+                    .show_ui(ui, |ui| {
+                        for e in eval::EASINGS {
+                            let current = t.easing.as_deref().unwrap_or("easeLinear") == *e;
+                            if ui.selectable_label(current, *e).clicked() {
+                                changes.push(Change::Easing((*e != "easeLinear").then(|| (*e).to_owned())));
+                            }
+                        }
+                    });
+                ui.end_row();
+                return;
             }
 
             ui.label("Type");
@@ -1526,7 +1728,7 @@ impl App {
             ui.end_row();
         });
 
-        if !self.palette.is_empty() {
+        if !self.palette.is_empty() && t.pos.is_none() {
             ui.add_space(10.0);
             ui.label(egui::RichText::new("Colors used in this map").strong());
             ui.horizontal_wrapped(|ui| {
@@ -1573,6 +1775,23 @@ impl App {
             self.dirty = true;
         self.rows_gen += 1;
         }
+    }
+
+    /// The lights the "Highlight in preview" checkbox picks out: the selected keys' rows, or the
+    /// active row when no key is selected.
+    fn highlight(&self) -> Option<Highlight> {
+        if !self.highlight_lights {
+            return None;
+        }
+        let rows = &self.beatmap.as_ref()?.rows;
+        let mut h = Highlight::default();
+        for r in rows.iter().filter(|r| r.keys.iter().any(|k| self.selected.contains(&k.id))) {
+            h.add(r);
+        }
+        if h.lanes.is_empty() {
+            h.add(rows.get(self.active_row?)?);
+        }
+        Some(h)
     }
 
     fn preview_ui(&mut self, ui: &mut egui::Ui) {
@@ -1648,7 +1867,11 @@ impl App {
         let _ = bm;
         let beat = self.playhead;
         let model = self.model.as_ref();
-        let light = |lane: i64, ids: &[i64]| model.map_or([0.0; 3], |m| m.rgb_keys(lane, ids, beat));
+        let highlight = self.highlight();
+        let light = |lane: i64, ids: &[i64]| {
+            let c = model.map_or([0.0; 3], |m| m.rgb_keys(lane, ids, beat));
+            highlight.as_ref().map_or(c, |h| h.rgb(lane, ids, c))
+        };
         let mut objs: Vec<(&Obj, &Scene)> = Vec::new();
         if self.show_base {
             objs.extend(self.base_objs.iter().map(|o| (o, &self.scene)));
@@ -1659,7 +1882,14 @@ impl App {
         if let (true, Some(e), Some(el), Some(gpu), Some(rs)) = (self.use_gpu, env, &self.env_lights, &mut self.gpu, &self.wgpu) {
             let ppp = ui.ctx().pixels_per_point();
             let (w, h) = (((rect.width() * ppp) as u32).max(1), ((rect.height() * ppp) as u32).max(1));
-            let state = el.state_at(e, &|k| model.map_or([0.0; 4], |m| m.color_keys(k.0, &k.1, beat)), &self.motion, seconds);
+            let mut state = el.state_at(e, &|k| model.map_or([0.0; 4], |m| m.color_keys(k.0, &k.1, beat)), &self.motion, seconds);
+            if let Some(bm) = &self.beatmap {
+                el.apply_positions(e, &mut state, &bm.rows, beat);
+            }
+            if let Some(h) = &highlight {
+                state.outline = el.light_objects(&|k| h.matches(k.0, &k.1));
+                state.outline_px = 2.0 * ppp;
+            }
             let fog = e.fog.unwrap_or(crate::environment::FogParams {
                 offset: 0.0,
                 height: 25.0,

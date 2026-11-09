@@ -152,7 +152,7 @@ pub fn base_stage(lanes: &[LaneLights], rows: &[crate::map::Row], scene: &Scene)
             .collect();
         if list.is_empty() { vec![None; default] } else { list }
     };
-    let used = |lane: i64| rows.iter().any(|r| r.lane == lane && !r.keys.is_empty());
+    let used = |lane: i64| rows.iter().any(|r| r.lane == lane && r.is_light() && !r.keys.is_empty());
 
     let mut out = vec![Obj {
         color: [0.18, 0.18, 0.2, 1.0],

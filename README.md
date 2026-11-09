@@ -7,6 +7,12 @@ and a live color preview strip under every row.
 Works on v2 and v3 difficulty files, including Chroma colors, light IDs, easings and
 legacy Chroma RGB values. Everything it doesn't edit is written back exactly as it was.
 
+![The editor: light lanes with keyframes over the song's waveform, and the 3D preview below](docs/images/overview.png)
+
+New here? The **[tutorial](docs/TUTORIAL.md)** walks through lighting a section step by step.
+
+![The preview at three moments of a song, rendered like ChroMapper](docs/images/preview.png)
+
 ## Run
 
 ```bash
@@ -14,6 +20,8 @@ cargo run --release -- "/path/to/Beat Saber_Data/CustomLevels/<map folder>"
 ```
 
 The folder is the one containing `Info.dat`. The last folder is remembered.
+
+The graphics driver needs Vulkan support. Developed and tested on Linux.
 
 ## Editing
 
@@ -52,6 +60,14 @@ view from the player's spot at the playhead:
   simple stand-in renderer.
 
 Drag to look around, use the wheel to move, double-click to reset the camera.
+
+Tick **Highlight in preview** in the Keyframe panel to see which lights you're editing: the selected
+keys' lights get a white outline.
+
+**Add Position line** and **Add Aim line** in the same panel add a line under a light group, with
+keys that move its lights or set where they point. They're saved as Chroma track animations; see
+the tutorial on [moving lights](docs/TUTORIAL.md#8-move-lights) and
+[aiming lasers](docs/TUTORIAL.md#9-aim-lasers) for the limits.
 
 The exported environments are kept in `~/.local/share/bs-light-timeline/environments/`, not in
 this repository.

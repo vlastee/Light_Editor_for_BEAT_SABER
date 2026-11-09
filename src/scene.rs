@@ -248,6 +248,10 @@ impl Scene {
         for e in cd[k("environment", "_environment")].as_array().into_iter().flatten() {
             let geo = &e[k("geometry", "_geometry")];
             if !geo.is_object() {
+                // The editor's own Position lines are previewed.
+                if tracks_of(e.get(k("track", "_track"))).iter().any(|t| t.starts_with(crate::map::TRACK_PREFIX)) {
+                    continue;
+                }
                 scene.base_edits += 1;
                 if e[k("active", "_active")] == Value::Bool(false) {
                     scene.hides_base = true;

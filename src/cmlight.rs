@@ -347,7 +347,7 @@ impl LightModel {
         };
         let mut lanes: HashMap<i64, Lane> = HashMap::new();
         let mut lites: HashMap<i64, Vec<Lite>> = HashMap::new();
-        for row in &bm.rows {
+        for row in bm.rows.iter().filter(|r| r.is_light()) {
             let ids = row.light_ids.as_ref().map(ids_of);
             for k in &row.keys {
                 let lerp = if k.lerp_hsv {

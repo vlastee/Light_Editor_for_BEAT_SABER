@@ -9,11 +9,12 @@
 
 use crate::environment::{EnvFile, EnvMaterial, FogParams};
 use eframe::wgpu;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use wgpu::util::DeviceExt;
 
 const HDR: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+const OUTLINE_MASK: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 const DEPTH: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 pub const OUTPUT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// ChroMapper's `bloomFogResolution` and fog frustum (BloomfogRendererSO: 130° x 130°).
@@ -194,6 +195,9 @@ pub struct SceneState {
     pub mirror_plane: Option<[f32; 4]>,
     /// Particle system index → its particles this frame (else the exported ones).
     pub particles: HashMap<usize, Vec<crate::environment::Particle>>,
+    /// Object indices to outline in white, and the outline's width in pixels.
+    pub outline: Vec<usize>,
+    pub outline_px: f32,
 }
 
 pub struct Frame<'a> {
@@ -365,6 +369,7 @@ struct Targets {
     bloom_up: Vec<wgpu::Texture>,
     bloom_final: wgpu::Texture,
     bloom_scale: f32,
+    outline_mask: wgpu::Texture,
 }
 
 struct Pipelines {
@@ -384,6 +389,8 @@ struct Pipelines {
     sky: wgpu::RenderPipeline,
     clamp: wgpu::RenderPipeline,
     composite: wgpu::RenderPipeline,
+    outline_mask: wgpu::RenderPipeline,
+    outline: wgpu::RenderPipeline,
 }
 
 pub struct Gpu3d {
@@ -556,6 +563,7 @@ impl Gpu3d {
         let mesh_layout = layout("mesh", &[&scene_layout, &fogtex_layout, &mat_layout]);
         let quad_layout = layout("quad", &[&scene_layout, &tex2_layout]);
         let full_layout = layout("full", &[&scene_layout, &pass_layout]);
+        let outline_layout = layout("outline", &[&scene_layout]);
         let add = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
         let max = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Max };
         let mesh_vertex = wgpu::VertexBufferLayout {
@@ -632,6 +640,8 @@ impl Gpu3d {
             sky: full("sky", "fs_sky", HDR, None, Some(depth_state(false, wgpu::CompareFunction::LessEqual))),
             clamp: full("clamp", "fs_clamp", HDR, None, None),
             composite: full("composite", "fs_composite", OUTPUT, None, None),
+            outline_mask: pipe("outline mask", &outline_layout, "vs_mesh", "fs_outline_mask", Some(mesh_vertex.clone()), OUTLINE_MASK, None, None),
+            outline: full("outline", "fs_outline", OUTPUT, Some(wgpu::BlendState::ALPHA_BLENDING), None),
         };
         let objects_cap = 256;
         let objects = device.create_buffer(&wgpu::BufferDescriptor {
@@ -836,6 +846,7 @@ impl Gpu3d {
             bloom_up,
             bloom_final: texture(d, "bloom final", bw, bh, HDR, rt),
             bloom_scale,
+            outline_mask: texture(d, "outline mask", w, h, OUTLINE_MASK, rt),
         });
     }
 
@@ -1185,6 +1196,8 @@ impl Gpu3d {
         // Objects (shared by the main and reflected views).
         let mut data = Vec::new();
         let mut items = Vec::new();
+        let outline: HashSet<usize> = f.state.outline.iter().copied().collect();
+        let mut outlined = Vec::new();
         for (i, o) in f.env.objects.iter().enumerate() {
             let (Some(mesh), true) = (o.mesh, o.enabled) else { continue };
             let Some(mi) = o.materials.first().and_then(|m| usize::try_from(*m).ok()).filter(|m| *m < self.materials.len()) else { continue };
@@ -1195,6 +1208,9 @@ impl Gpu3d {
             }
             let matrix = f.state.moved.get(&i).copied().unwrap_or(o.matrix);
             let reflect = o.layer.is_none_or(|l| l < 32 && MIRROR_LAYERS >> l & 1 == 1);
+            if outline.contains(&i) {
+                outlined.push((data.len() as u32, mesh));
+            }
             items.push(DrawItem { reflect, object: data.len() as u32, mesh, material: mi, additive: mat.additive, queue: mat.queue });
             data.push(ObjectData {
                 model: mat_rows_to_cols(&matrix),
@@ -1311,6 +1327,27 @@ impl Gpu3d {
             PassParams { texel: texel(&t.clamped), combine: [if f.post_bloom { BLOOM_BLEND } else { 0.0 }, 0.0, 0.0, 0.0] },
         );
         self.fullscreen(&mut enc, &self.pipes.composite, &out, true, &scene, &bg);
+        // Selected lights: a white outline around their silhouettes, over everything.
+        if !outlined.is_empty() {
+            let mask = view(&t.outline_mask);
+            {
+                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("outline mask"),
+                    color_attachments: &[color_att(&mask, true)],
+                    ..Default::default()
+                });
+                pass.set_pipeline(&self.pipes.outline_mask);
+                pass.set_bind_group(0, &scene, &[]);
+                for (object, mesh) in &outlined {
+                    let Some(m) = self.meshes.get(*mesh).filter(|m| m.count > 0) else { continue };
+                    pass.set_vertex_buffer(0, m.vb.slice(..));
+                    pass.set_index_buffer(m.ib.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..m.count, 0, *object..*object + 1);
+                }
+            }
+            let bg = self.pass_group(&mask, &self.black, &self.black, PassParams { texel: texel(&t.outline_mask), combine: [f.state.outline_px, 0.0, 0.0, 0.0] });
+            self.fullscreen(&mut enc, &self.pipes.outline, &out, false, &scene, &bg);
+        }
         self.queue.submit([enc.finish()]);
         &self.targets.as_ref().expect("targets").output
     }

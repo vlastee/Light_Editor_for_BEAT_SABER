@@ -4,6 +4,8 @@
 
 use crate::environment::EnvFile;
 use crate::gpu3d::{srgb_to_linear, Block, DirLights, FogLight, SceneState, SkyGradient};
+use crate::map::{MoveTarget, Row, RowKind};
+use crate::scene::Quat;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
@@ -112,9 +114,51 @@ impl Combined {
     }
 }
 
+/// The rotation part of a matrix given by rows (columns of unit length; mirroring removed).
+fn rotation_of(m: &[f32; 16]) -> [[f32; 3]; 3] {
+    let mut c: [[f32; 3]; 3] = std::array::from_fn(|k| {
+        let v = [m[k], m[4 + k], m[8 + k]];
+        let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-6);
+        v.map(|x| x / len)
+    });
+    let [a, b, d] = c;
+    let det = a[0] * (b[1] * d[2] - b[2] * d[1]) - a[1] * (b[0] * d[2] - b[2] * d[0]) + a[2] * (b[0] * d[1] - b[1] * d[0]);
+    if det < 0.0 {
+        c[0] = a.map(|x| -x);
+    }
+    c
+}
+
+/// A world matrix (by rows) turned by `q` around the world point `pivot`.
+fn turned(m: &[f32; 16], q: Quat, pivot: [f32; 3]) -> [f32; 16] {
+    let mut out = *m;
+    for k in 0..3 {
+        let c = q.rotate([m[k], m[4 + k], m[8 + k]]);
+        (out[k], out[4 + k], out[8 + k]) = (c[0], c[1], c[2]);
+    }
+    let t = q.rotate([m[3] - pivot[0], m[7] - pivot[1], m[11] - pivot[2]]);
+    (out[3], out[7], out[11]) = (pivot[0] + t[0], pivot[1] + t[1], pivot[2] + t[2]);
+    out
+}
+
+/// A light's GameObject that a Position or Aim line can move, with what's drawn under it.
+struct Mover {
+    path: String,
+    keys: Vec<Key>,
+    /// World position (environment units).
+    rest: [f32; 3],
+    /// Normal world rotation (columns).
+    rot: [[f32; 3]; 3],
+    objects: Vec<usize>,
+    fogs: Vec<usize>,
+}
+
 /// An environment's light components, loaded once.
 #[derive(Default)]
 pub struct EnvLights {
+    movers: Vec<Mover>,
+    /// Lights whose GameObject name isn't unique, so Chroma can't address them alone (rings).
+    unmovable: Vec<Key>,
     boxes: Vec<BoxLight>,
     glows: Vec<FakeGlow>,
     fog: Vec<(FogLight, Option<Key>, String)>,
@@ -236,6 +280,33 @@ impl EnvLights {
             .zip(bloomfog.as_array().unwrap_or(&empty))
             .map(|(l, b)| (l, owned(b), b["path"].as_str().unwrap_or_default().to_owned()))
             .collect();
+        // Movable lights: one GameObject per name (several controllers can share an object).
+        let same = |a: &[f32; 16], b: &[f32; 16]| (0..16).all(|i| (a[i] - b[i]).abs() < 1e-3);
+        let controllers: Vec<(&str, Key, [f32; 3], [f32; 16])> = comps
+            .iter()
+            .filter(|c| c["type"] == "ParametricBloomFogLightController")
+            .filter_map(|c| {
+                let t = |k: usize| f(&c["m"][k], 0.0);
+                let matrix: [f32; 16] = std::array::from_fn(t);
+                Some((c["path"].as_str()?, key_of(&c["light"])?, [t(3), t(7), t(11)], matrix))
+            })
+            .collect();
+        for (path, key, rest, m) in &controllers {
+            if controllers.iter().any(|(p, _, _, o)| p == path && !same(o, m)) {
+                out.unmovable.push(key.clone());
+            } else if let Some(mover) = out.movers.iter_mut().find(|v| v.path == *path) {
+                mover.keys.push(key.clone());
+            } else {
+                out.movers.push(Mover {
+                    path: (*path).to_owned(),
+                    keys: vec![key.clone()],
+                    rest: *rest,
+                    rot: rotation_of(m),
+                    objects: env.objects.iter().enumerate().filter(|(_, o)| crate::motion::under(&o.path, path)).map(|(i, _)| i).collect(),
+                    fogs: out.fog.iter().enumerate().filter(|(_, (_, _, p))| crate::motion::under(p, path)).map(|(i, _)| i).collect(),
+                });
+            }
+        }
         out
     }
 
@@ -313,6 +384,77 @@ impl EnvLights {
             }
         }
         s
+    }
+
+    /// The objects showing the lights `pick` selects: their tubes, or their glow panels for lights
+    /// without tubes (a glow's mesh is its whole halo).
+    pub fn light_objects(&self, pick: &dyn Fn(&Key) -> bool) -> Vec<usize> {
+        let tubes: Vec<usize> = self.boxes.iter().filter(|b| b.key.as_ref().is_some_and(|k| pick(k))).map(|b| b.object).collect();
+        if !tubes.is_empty() {
+            return tubes;
+        }
+        self.glows.iter().filter(|g| g.key.as_ref().is_some_and(|k| pick(k))).map(|g| g.object).collect()
+    }
+
+    /// What a Position line can move in the game (metres), and how many of its lights it can't.
+    pub fn move_targets(&self, row: &Row, unit: f32) -> (Vec<MoveTarget>, usize) {
+        let targets = self
+            .movers
+            .iter()
+            .filter(|m| m.keys.iter().any(|k| row.reaches(k.0, &k.1)))
+            .map(|m| MoveTarget { path: m.path.clone(), rest: m.rest.map(|v| v * unit), rot: m.rot })
+            .collect();
+        (targets, self.unmovable.iter().filter(|k| row.reaches(k.0, &k.1)).count())
+    }
+
+    /// How many of an Aim line's lights spin from laser-speed events between `from` and `to` seconds.
+    pub fn spinning(&self, row: &Row, motion: &crate::motion::Motion, from: f32, to: f32) -> usize {
+        let reached: Vec<&Mover> = self.movers.iter().filter(|m| m.keys.iter().any(|k| row.reaches(k.0, &k.1))).collect();
+        let steps = ((to - from) * 4.0).ceil().clamp(1.0, 4000.0) as usize;
+        let mut spun = std::collections::HashSet::new();
+        for step in 0..=steps {
+            let t = from + (to - from) * step as f32 / steps as f32;
+            for (pivot, _) in motion.deltas(t) {
+                spun.extend(reached.iter().filter(|m| crate::motion::under(&m.path, pivot)).map(|m| m.path.as_str()));
+            }
+        }
+        spun.len()
+    }
+
+    /// Moves and turns lights by the map's Position and Aim lines at `beat`. The first line of each
+    /// kind reaching a light wins. An aimed light ignores laser spin: it points where the keys say.
+    pub fn apply_positions(&self, env: &EnvFile, s: &mut SceneState, rows: &[Row], beat: f64) {
+        let lines: Vec<&Row> = rows.iter().filter(|r| !r.is_light() && !r.keys.is_empty()).collect();
+        if lines.is_empty() {
+            return;
+        }
+        for m in &self.movers {
+            let line = |kind: RowKind| lines.iter().find(|r| r.kind == kind && m.keys.iter().any(|k| r.reaches(k.0, &k.1)));
+            if let Some(q) = line(RowKind::Aim).and_then(|r| r.aim_at(beat)) {
+                for &i in &m.objects {
+                    s.moved.insert(i, turned(&env.objects[i].matrix, q, m.rest));
+                }
+                for &i in &m.fogs {
+                    s.fog_lights[i].matrix = turned(&self.fog[i].0.matrix, q, m.rest);
+                }
+            }
+            if let Some(r) = line(RowKind::Position) {
+                let off = r.position_at(beat).map(|v| v / env.unit);
+                let shift = |mat: &mut [f32; 16]| {
+                    mat[3] += off[0];
+                    mat[7] += off[1];
+                    mat[11] += off[2];
+                };
+                for &i in &m.objects {
+                    let mut mat = s.moved.get(&i).copied().unwrap_or(env.objects[i].matrix);
+                    shift(&mut mat);
+                    s.moved.insert(i, mat);
+                }
+                for &i in &m.fogs {
+                    shift(&mut s.fog_lights[i].matrix);
+                }
+            }
+        }
     }
 
     pub fn mirror_plane(&self) -> Option<[f32; 4]> {

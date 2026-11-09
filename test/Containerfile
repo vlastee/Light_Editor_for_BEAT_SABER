@@ -1,8 +1,8 @@
-# Headless X11 environment for driving the app: Xvfb + Mesa (software GL) + xdotool.
+# Headless X11 environment for driving the app: Xvfb + Mesa (software GL and Vulkan) + xdotool.
 FROM docker.io/library/ubuntu:26.04
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         xvfb xdotool x11-apps imagemagick \
-        libgl1 libegl1 libgl1-mesa-dri libglx-mesa0 \
+        libgl1 libegl1 libgl1-mesa-dri libglx-mesa0 mesa-vulkan-drivers \
         libx11-6 libxcursor1 libxrandr2 libxi6 libxkbcommon-x11-0 libxkbcommon0 \
         libasound2t64 fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*

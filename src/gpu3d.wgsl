@@ -567,6 +567,28 @@ fn fs_clamp(v: FOut) -> @location(0) vec4<f32> {
 }
 
 // PostBloom: scene + its bloom alpha squared (white boost), plus 0.3 x bloom.
+// Selected lights' silhouettes.
+@fragment
+fn fs_outline_mask() -> @location(0) vec4<f32> {
+    return vec4<f32>(1.0);
+}
+
+// White just outside the mask (src_a), pp.combine.x pixels wide; the light itself keeps its color.
+@fragment
+fn fs_outline(v: FOut) -> @location(0) vec4<f32> {
+    if (tap(src_a, v.uv).r > 0.5) {
+        discard;
+    }
+    let r = pp.texel.xy * pp.combine.x;
+    var cover = 0.0;
+    for (var i = 0; i < 16; i++) {
+        let a = f32(i) * 0.39269908;
+        let d = vec2<f32>(cos(a), sin(a)) * r;
+        cover = max(cover, max(tap(src_a, v.uv + d).r, tap(src_a, v.uv + d * 0.5).r));
+    }
+    return vec4<f32>(1.0, 1.0, 1.0, cover);
+}
+
 @fragment
 fn fs_composite(v: FOut) -> @location(0) vec4<f32> {
     let t = pp.texel.xy;
