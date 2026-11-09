@@ -18,9 +18,37 @@ pub const LIGHT_LANES: &[(i64, &str)] = &[
     (11, "Right Lasers 2"),
 ];
 
+/// Other event types that change how the lights look or move. Each is one timeline row.
+pub const EFFECT_LANES: &[(i64, &str)] = &[
+    (5, "Color Boost"),
+    (8, "Ring Spin"),
+    (9, "Ring Zoom"),
+    (12, "Left Laser Speed"),
+    (13, "Right Laser Speed"),
+    (16, "Special 16"),
+    (17, "Special 17"),
+    (18, "Special 18"),
+    (19, "Special 19"),
+    (40, "Special 40"),
+    (41, "Special 41"),
+    (42, "Special 42"),
+    (43, "Special 43"),
+];
+
+/// Effect lanes always offered; the Special ones only appear in maps that use them.
+const COMMON_EFFECTS: [i64; 5] = [5, 8, 9, 12, 13];
+
+/// Top-to-bottom order of the lanes on the timeline.
+pub const LANE_ORDER: &[i64] = &[5, 0, 1, 8, 9, 2, 12, 3, 13, 4, 6, 7, 10, 11, 16, 17, 18, 19, 40, 41, 42, 43];
+
+pub fn is_effect_lane(et: i64) -> bool {
+    EFFECT_LANES.iter().any(|(t, _)| *t == et)
+}
+
 pub fn lane_name(et: i64) -> &'static str {
     LIGHT_LANES
         .iter()
+        .chain(EFFECT_LANES)
         .find(|(t, _)| *t == et)
         .map_or("Unknown", |(_, n)| n)
 }
@@ -153,6 +181,10 @@ pub struct Key {
     /// On a Position line: how far the lights are moved from where they normally are (metres).
     /// On an Aim line: how far they're turned from how they normally point (degrees: X, Y, Z).
     pub pos: Option<[f32; 3]>,
+    /// On an effect row (boost, ring, laser speed…); `raw_value` holds its value.
+    pub effect: bool,
+    /// An effect event as it was in the file, written back unchanged until it's edited.
+    pub source: Option<Value>,
 }
 
 /// Legacy Chroma stored RGB in the value itself: 2_000_000_000 + 0xRRGGBB.
@@ -181,7 +213,37 @@ impl Key {
             extra: Map::new(),
             extra_custom: Map::new(),
             pos: Some(pos),
+            effect: false,
+            source: None,
         }
+    }
+
+    /// A keyframe on an effect row.
+    pub fn effect(id: u64, beat: f64, lane: i64, value: i64) -> Key {
+        Key {
+            id,
+            beat,
+            kind: Key::effect_shape(lane, value),
+            base: Base::Blue,
+            color: Some([0.95, 0.85, 0.45, 1.0]),
+            color_rgb_only: false,
+            brightness: 1.0,
+            raw_value: Some(value),
+            color_src: None,
+            brightness_src: None,
+            easing: None,
+            lerp_hsv: false,
+            extra: Map::new(),
+            extra_custom: Map::new(),
+            pos: None,
+            effect: true,
+            source: None,
+        }
+    }
+
+    /// Off-shaped when the value switches the effect off; ring events are just triggers.
+    pub fn effect_shape(lane: i64, value: i64) -> Kind {
+        if value == 0 && matches!(lane, 5 | 12 | 13) { Kind::Off } else { Kind::On }
     }
 
     pub fn display_color(&self) -> [f32; 4] {
@@ -222,6 +284,8 @@ pub enum RowKind {
     Light,
     Position,
     Aim,
+    /// Non-light events: boost, ring spin and zoom, laser speed, special events.
+    Effect,
 }
 
 impl Row {
@@ -229,10 +293,19 @@ impl Row {
         self.kind == RowKind::Light
     }
 
+    pub fn is_motion(&self) -> bool {
+        matches!(self.kind, RowKind::Position | RowKind::Aim)
+    }
+
+    pub fn is_effect(&self) -> bool {
+        self.kind == RowKind::Effect
+    }
+
     pub fn label(&self) -> String {
         match self.kind {
             RowKind::Position => return "Position".to_owned(),
             RowKind::Aim => return "Aim".to_owned(),
+            RowKind::Effect => return lane_name(self.lane).to_owned(),
             RowKind::Light => {}
         }
         match &self.light_ids {
@@ -524,6 +597,11 @@ pub fn load_beatmap(path: &Path, next_id: &mut u64) -> Result<Beatmap, String> {
     for ev in json[n.list].as_array().into_iter().flatten() {
         let Some(obj) = ev.as_object() else { continue };
         let et = obj.get(n.et).and_then(Value::as_i64).unwrap_or(0);
+        if is_effect_lane(et) {
+            *next_id += 1;
+            add_effect(&mut rows, et, effect_key(n, *next_id, et, ev, obj));
+            continue;
+        }
         if !LIGHT_LANES.iter().any(|(t, _)| *t == et) {
             other_events.push(ev.clone());
             continue;
@@ -590,6 +668,8 @@ pub fn load_beatmap(path: &Path, next_id: &mut u64) -> Result<Beatmap, String> {
             extra,
             extra_custom: custom,
             pos: None,
+            effect: false,
+            source: None,
         };
 
         match rows
@@ -606,6 +686,20 @@ pub fn load_beatmap(path: &Path, next_id: &mut u64) -> Result<Beatmap, String> {
         }
     }
 
+    for ev in json[BOOST_LIST].as_array().into_iter().flatten() {
+        let Some(beat) = ev["b"].as_f64() else { continue };
+        *next_id += 1;
+        let on = i64::from(ev["o"].as_bool().unwrap_or(false));
+        let mut key = Key::effect(*next_id, beat, 5, on);
+        key.source = Some(ev.clone());
+        add_effect(&mut rows, 5, key);
+    }
+    for lane in COMMON_EFFECTS {
+        if !rows.iter().any(|r| r.lane == lane) {
+            rows.push(Row { lane, light_ids: None, keys: Vec::new(), kind: RowKind::Effect });
+        }
+    }
+
     // Make sure every lane has at least an "all lights" row to add keys to.
     for (lane, _) in LIGHT_LANES {
         if !rows.iter().any(|r| r.lane == *lane && r.light_ids.is_none()) {
@@ -618,7 +712,7 @@ pub fn load_beatmap(path: &Path, next_id: &mut u64) -> Result<Beatmap, String> {
         }
     }
 
-    let lane_order = |et: i64| LIGHT_LANES.iter().position(|(t, _)| *t == et).unwrap_or(99);
+    let lane_order = |et: i64| LANE_ORDER.iter().position(|t| *t == et).unwrap_or(99);
     rows.sort_by_key(|r| (lane_order(r.lane), r.light_ids.is_some()));
     for r in &mut rows {
         r.sort();
@@ -633,6 +727,30 @@ pub fn load_beatmap(path: &Path, next_id: &mut u64) -> Result<Beatmap, String> {
         rows,
         backed_up: false,
     })
+}
+
+const BOOST_LIST: &str = "colorBoostBeatmapEvents";
+
+fn effect_key(n: &Names, id: u64, lane: i64, ev: &Value, obj: &Map<String, Value>) -> Key {
+    let value = obj.get(n.i).and_then(Value::as_i64).unwrap_or(0);
+    let mut key = Key::effect(id, obj.get(n.b).and_then(Value::as_f64).unwrap_or(0.0), lane, value);
+    key.brightness_src = obj.get(n.f).cloned();
+    key.extra = obj.clone();
+    for field in [n.b, n.et, n.i, n.f, n.custom] {
+        key.extra.remove(field);
+    }
+    if let Some(Value::Object(m)) = obj.get(n.custom) {
+        key.extra_custom = m.clone();
+    }
+    key.source = Some(ev.clone());
+    key
+}
+
+fn add_effect(rows: &mut Vec<Row>, lane: i64, key: Key) {
+    match rows.iter_mut().find(|r| r.lane == lane) {
+        Some(row) => row.keys.push(key),
+        None => rows.push(Row { lane, light_ids: None, keys: vec![key], kind: RowKind::Effect }),
+    }
 }
 
 /// Position lines saved by the editor (`POSITIONS_KEY` in the difficulty's custom data), each placed
@@ -668,7 +786,7 @@ pub fn line_slot(rows: &[Row], at: usize, kind: RowKind) -> usize {
         return at + 1;
     }
     let mut i = at + 1;
-    while rows.get(i).is_some_and(|r| !r.is_light()) {
+    while rows.get(i).is_some_and(|r| r.is_motion()) {
         i += 1;
     }
     i
@@ -715,7 +833,48 @@ fn clean(x: f32) -> f64 {
     format!("{x}").parse().unwrap_or(f64::from(x))
 }
 
+/// In v3, boost events live in their own list (unless the file had them as basic events).
+fn in_boost_list(n: &Names, row: &Row, key: &Key) -> bool {
+    n.version == "v3" && row.lane == 5 && key.source.as_ref().is_none_or(|s| s.get(n.et).is_none())
+}
+
+/// The effect event as it was, while it hasn't been changed.
+fn unchanged<'a>(n: &Names, key: &'a Key) -> Option<&'a Value> {
+    let s = key.source.as_ref()?;
+    (s.get(n.b).and_then(Value::as_f64).unwrap_or(0.0) == key.beat).then_some(s)
+}
+
+fn effect_to_event(n: &Names, row: &Row, key: &Key) -> Value {
+    if let Some(s) = unchanged(n, key) {
+        return s.clone();
+    }
+    let mut obj = Map::new();
+    obj.insert(n.b.into(), json!(key.beat));
+    obj.insert(n.et.into(), json!(row.lane));
+    obj.insert(n.i.into(), json!(key.raw_value.unwrap_or(0)));
+    if let Some(f) = &key.brightness_src {
+        obj.insert(n.f.into(), f.clone());
+    }
+    for (k, v) in &key.extra {
+        obj.insert(k.clone(), v.clone());
+    }
+    if !key.extra_custom.is_empty() {
+        obj.insert(n.custom.into(), Value::Object(key.extra_custom.clone()));
+    }
+    Value::Object(obj)
+}
+
+fn boost_to_event(n: &Names, key: &Key) -> Value {
+    match (unchanged(n, key), key.source.as_ref()) {
+        (Some(s), _) => s.clone(),
+        _ => json!({ "b": key.beat, "o": key.raw_value.unwrap_or(0) != 0 }),
+    }
+}
+
 fn key_to_event(n: &Names, row: &Row, key: &Key) -> Value {
+    if row.is_effect() {
+        return effect_to_event(n, row, key);
+    }
     let mut obj = Map::new();
     obj.insert(n.b.into(), json!(key.beat));
     obj.insert(n.et.into(), json!(row.lane));
@@ -763,12 +922,33 @@ impl Beatmap {
         self.rows.iter().filter(|r| r.is_light()).map(|r| r.keys.len()).sum()
     }
 
+    /// v3's separate boost list as it would be saved; `None` for v2.
+    pub fn build_boosts(&self) -> Option<Vec<Value>> {
+        let n = self.names;
+        if n.version != "v3" {
+            return None;
+        }
+        let row = self.rows.iter().find(|r| r.lane == 5)?;
+        Some(row.keys.iter().filter(|k| in_boost_list(n, row, k)).map(|k| boost_to_event(n, k)).collect())
+    }
+
+    /// Puts the effect rows back in the JSON, which the light model and laser motion read.
+    pub fn sync_events(&mut self) {
+        self.json[self.names.list] = Value::Array(self.build_events());
+        if let Some(b) = self.build_boosts() {
+            if !b.is_empty() || self.json.get(BOOST_LIST).is_some() {
+                self.json[BOOST_LIST] = Value::Array(b);
+            }
+        }
+    }
+
     /// The full basic event list as it would be saved.
     pub fn build_events(&self) -> Vec<Value> {
         let n = self.names;
         let mut events = self.other_events.clone();
-        for row in self.rows.iter().filter(|r| r.is_light()) {
-            events.extend(row.keys.iter().map(|k| key_to_event(n, row, k)));
+        for row in self.rows.iter().filter(|r| !r.is_motion()) {
+            let in_list = row.keys.iter().filter(|k| !in_boost_list(n, row, k));
+            events.extend(in_list.map(|k| key_to_event(n, row, k)));
         }
         events.sort_by(|a, b| {
             let fa = a[n.b].as_f64().unwrap_or(0.0);
@@ -787,7 +967,7 @@ impl Beatmap {
         let name = |a: &'static str, b: &'static str| if v3 { a } else { b };
         let (env_key, events_key, track_key) = (name("environment", "_environment"), name("customEvents", "_customEvents"), name("track", "_track"));
         let data_key = name("d", "_data");
-        let lines: Vec<&Row> = self.rows.iter().filter(|r| !r.is_light() && !r.keys.is_empty()).collect();
+        let lines: Vec<&Row> = self.rows.iter().filter(|r| r.is_motion() && !r.keys.is_empty()).collect();
         let saved: Vec<Value> = lines
             .iter()
             .map(|r| {
@@ -905,7 +1085,7 @@ impl Beatmap {
 
     /// Writes the rows back into the difficulty file. Backs up the original file once per session.
     pub fn save(&mut self) -> Result<String, String> {
-        self.json[self.names.list] = Value::Array(self.build_events());
+        self.sync_events();
 
         let mut msg = String::new();
         if !self.backed_up {
@@ -1055,6 +1235,44 @@ mod tests {
         assert_eq!(r.position_at(4.0), [0.0, 2.0, 0.0]);
         assert_eq!(r.position_at(6.0)[0], 0.25); // easeInQuad at the halfway point
         assert_eq!(r.position_at(20.0), [1.0, 2.0, 0.0]);
+    }
+
+    #[test]
+    fn effect_events_round_trip_and_edit() {
+        let n = &V3;
+        let ev = json!({ "b": 4, "et": 12, "i": 1, "customData": { "direction": 1, "lockRotation": false } });
+        let obj = ev.as_object().unwrap().clone();
+        let mut key = effect_key(n, 1, 12, &ev, &obj);
+        let row = Row { lane: 12, light_ids: None, keys: vec![key.clone()], kind: RowKind::Effect };
+        // Untouched: exactly as it was, including no "f".
+        assert_eq!(effect_to_event(n, &row, &key), ev);
+        // Moved: rebuilt with its custom fields.
+        key.beat = 6.0;
+        let moved = effect_to_event(n, &row, &key);
+        assert_eq!((moved["b"].as_f64(), moved["i"].as_i64()), (Some(6.0), Some(1)));
+        assert_eq!(moved["customData"]["direction"], 1);
+        assert!(moved.get("f").is_none());
+    }
+
+    #[test]
+    fn v3_boosts_go_to_their_own_list() {
+        let mut key = Key::effect(1, 2.0, 5, 1);
+        key.source = Some(json!({ "b": 2.0, "o": true }));
+        let new = Key::effect(2, 8.0, 5, 0);
+        let rows = vec![Row { lane: 5, light_ids: None, keys: vec![key, new], kind: RowKind::Effect }];
+        let mut bm = Beatmap { path: PathBuf::new(), names: &V3, json: json!({}), other_events: Vec::new(), rows, backed_up: false };
+        assert_eq!(bm.build_boosts().unwrap(), [json!({ "b": 2.0, "o": true }), json!({ "b": 8.0, "o": false })]);
+        assert!(bm.build_events().is_empty());
+        bm.sync_events();
+        assert_eq!(bm.json[BOOST_LIST].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn v2_boosts_stay_basic_events() {
+        let rows = vec![Row { lane: 5, light_ids: None, keys: vec![Key::effect(1, 2.0, 5, 1)], kind: RowKind::Effect }];
+        let bm = Beatmap { path: PathBuf::new(), names: &V2, json: json!({}), other_events: Vec::new(), rows, backed_up: false };
+        assert!(bm.build_boosts().is_none());
+        assert_eq!(bm.build_events()[0]["_type"], 5);
     }
 
     #[test]

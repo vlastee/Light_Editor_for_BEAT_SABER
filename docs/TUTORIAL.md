@@ -159,7 +159,30 @@ Aim lines save the same way as Position lines and have the same limits. In addit
   two may fight over the laser, so the editor warns you on save when aimed lasers also spin. Turn
   off the laser speed for those lasers during that stretch.
 
-## 10. Rearrange
+## 10. Boost, rings and laser speed
+
+Events that aren't light colors have yellow rows of their own: **Color Boost**, **Ring Spin**,
+**Ring Zoom**, **Left Laser Speed** and **Right Laser Speed**. Maps for some environments also show
+**Special** rows. Add, move, copy and delete their keys like any others.
+
+![Yellow rows for boost, rings and laser speed on the timeline](images/effects.png)
+
+Select a key to change it in the **Keyframe** panel:
+
+| Row | Settings |
+|---|---|
+| Color Boost | On or off. The boost colors stay until the next key. |
+| Laser Speed | Speed, direction, and **Keep angle** so the lasers don't jump to a new angle. Speed 0 stops them. |
+| Ring Spin | Optional Chroma settings: rotation, step, propagation, speed, direction. Tick a box to use one. |
+| Ring Zoom | Optional Chroma settings: step and speed. |
+| Special | The event's value. What it does depends on the environment. |
+
+A band on the Color Boost and Laser Speed rows shows when the boost is on or the lasers are spinning.
+Boost, laser speed, ring spin and ring zoom changes show up in the preview straight away. Without
+Chroma settings the game picks each ring spin's direction and step at random, so the rings can end up
+at different angles from the preview. **Special** events aren't previewed.
+
+## 11. Rearrange
 
 | Action | How |
 |---|---|
@@ -170,7 +193,7 @@ Aim lines save the same way as Position lines and have the same limits. In addit
 | Delete | `Delete` or `X` |
 | Undo, redo | `Ctrl+Z`, `Ctrl+Shift+Z` |
 
-## 11. Save
+## 12. Save
 
 Press `Ctrl+S`. The **Save** button shows `Save*` while there are unsaved changes, and **Revert**
 goes back to the last saved state.

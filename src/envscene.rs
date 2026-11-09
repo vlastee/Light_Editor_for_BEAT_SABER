@@ -156,6 +156,8 @@ struct Mover {
 /// An environment's light components, loaded once.
 #[derive(Default)]
 pub struct EnvLights {
+    /// Ring id → what's drawn on that ring: object indices and fog light indices.
+    ring_members: HashMap<i64, (Vec<usize>, Vec<usize>)>,
     movers: Vec<Mover>,
     /// Lights whose GameObject name isn't unique, so Chroma can't address them alone (rings).
     unmovable: Vec<Key>,
@@ -177,7 +179,19 @@ impl EnvLights {
         let bloomfog = read("bloomfog.json");
         let empty = Vec::new();
         let comps = comps.as_array().unwrap_or(&empty);
-        let by_path: HashMap<&str, usize> = env.objects.iter().enumerate().map(|(i, o)| (o.path.as_str(), i)).collect();
+        // Several objects can share a path (rings are copies): the one at the component's position.
+        let mut by_path: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, o) in env.objects.iter().enumerate() {
+            by_path.entry(o.path.as_str()).or_default().push(i);
+        }
+        let object_at = |path: &str, c: &Value| -> Option<usize> {
+            let at = |o: usize| {
+                let m = &env.objects[o].matrix;
+                let d = |a: f32, b: f32| (a - b) * (a - b);
+                d(m[3], f(&c["m"][3], 0.0)) + d(m[7], f(&c["m"][7], 0.0)) + d(m[11], f(&c["m"][11], 0.0))
+            };
+            by_path.get(path)?.iter().copied().min_by(|a, b| at(*a).total_cmp(&at(*b)))
+        };
         // The light (lane, map IDs) of the ParametricBloomFogLightController that owns each tube, glow
         // sprite and fog object (an object can hold controllers for several lanes).
         let mut owner: HashMap<i64, Key> = HashMap::new();
@@ -197,7 +211,7 @@ impl EnvLights {
             match c["type"].as_str().unwrap_or_default() {
                 "ParametricBoxLight" => {
                     let rpath = x["Renderer"]["path"].as_str().unwrap_or(path);
-                    let Some(&object) = by_path.get(rpath) else { continue };
+                    let Some(object) = object_at(rpath, c) else { continue };
                     out.boxes.push(BoxLight {
                         object,
                         key: owned(c),
@@ -208,7 +222,7 @@ impl EnvLights {
                     });
                 }
                 "RectangleFakeGlowLightController" => {
-                    let Some(&object) = by_path.get(path) else { continue };
+                    let Some(object) = object_at(path, c) else { continue };
                     let size = v4(&x["Size"]);
                     let edge = f(&x["EdgeSize"], 0.0);
                     out.glows.push(FakeGlow {
@@ -280,6 +294,27 @@ impl EnvLights {
             .zip(bloomfog.as_array().unwrap_or(&empty))
             .map(|(l, b)| (l, owned(b), b["path"].as_str().unwrap_or_default().to_owned()))
             .collect();
+        // Rings share names, so each part belongs to the ring of its name nearest in depth.
+        let mut ring_paths: HashMap<&str, Vec<(i64, f32)>> = HashMap::new();
+        for c in comps.iter().filter(|c| c["type"] == "TrackLaneRing") {
+            if let (Some(p), Some(id)) = (c["path"].as_str(), c["id"].as_i64()) {
+                ring_paths.entry(p).or_default().push((id, f(&c["m"][11], 0.0)));
+            }
+        }
+        let owner_ring = |path: &str, z: f32| -> Option<i64> {
+            let rings = ring_paths.iter().find(|(p, _)| crate::motion::under(path, p))?.1;
+            rings.iter().min_by(|a, b| (a.1 - z).abs().total_cmp(&(b.1 - z).abs())).map(|r| r.0)
+        };
+        for (i, o) in env.objects.iter().enumerate() {
+            if let Some(id) = owner_ring(&o.path, o.matrix[11]) {
+                out.ring_members.entry(id).or_default().0.push(i);
+            }
+        }
+        for (i, (l, _, path)) in out.fog.iter().enumerate() {
+            if let Some(id) = owner_ring(path, l.matrix[11]) {
+                out.ring_members.entry(id).or_default().1.push(i);
+            }
+        }
         // Movable lights: one GameObject per name (several controllers can share an object).
         let same = |a: &[f32; 16], b: &[f32; 16]| (0..16).all(|i| (a[i] - b[i]).abs() < 1e-3);
         let controllers: Vec<(&str, Key, [f32; 3], [f32; 16])> = comps
@@ -383,6 +418,16 @@ impl EnvLights {
                 }
             }
         }
+        for (ring, delta) in motion.ring_deltas(seconds) {
+            let Some((objects, fogs)) = self.ring_members.get(&ring) else { continue };
+            for &i in objects {
+                let base = s.moved.get(&i).copied().unwrap_or(env.objects[i].matrix);
+                s.moved.insert(i, apply(&delta, &base));
+            }
+            for &i in fogs {
+                s.fog_lights[i].matrix = apply(&delta, &s.fog_lights[i].matrix);
+            }
+        }
         s
     }
 
@@ -424,7 +469,7 @@ impl EnvLights {
     /// Moves and turns lights by the map's Position and Aim lines at `beat`. The first line of each
     /// kind reaching a light wins. An aimed light ignores laser spin: it points where the keys say.
     pub fn apply_positions(&self, env: &EnvFile, s: &mut SceneState, rows: &[Row], beat: f64) {
-        let lines: Vec<&Row> = rows.iter().filter(|r| !r.is_light() && !r.keys.is_empty()).collect();
+        let lines: Vec<&Row> = rows.iter().filter(|r| r.is_motion() && !r.keys.is_empty()).collect();
         if lines.is_empty() {
             return;
         }

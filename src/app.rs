@@ -12,7 +12,7 @@ use eframe::egui::{
     self, Align2, Color32, FontId, Painter, PointerButton, Pos2, Rect, Sense, Shape, Stroke,
     StrokeKind, Vec2,
 };
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -64,22 +64,43 @@ enum Change {
     Hsv(bool),
     /// A Position key's offset along one axis.
     Axis(usize, f32),
+    /// An effect key's value, and its lane for the key shape.
+    Value(i64, i64),
+    /// An effect key's Chroma field: set, or removed.
+    Custom(String, Option<Value>),
 }
 
 impl Change {
     fn apply(&self, k: &mut Key) {
-        // Position keys have no light fields, light keys no offset.
-        match (self, &mut k.pos) {
-            (Change::Axis(a, v), Some(p)) => {
-                p[*a] = *v;
-                return;
-            }
-            (Change::Axis(..), None) => return,
-            (Change::Beat(_) | Change::Easing(_), _) | (_, None) => {}
-            (_, Some(_)) => return,
+        // Each kind of key only takes its own fields (a selection can mix them).
+        let takes = match self {
+            Change::Beat(_) => true,
+            Change::Easing(_) => !k.effect,
+            Change::Axis(..) => k.pos.is_some(),
+            Change::Value(..) | Change::Custom(..) => k.effect,
+            _ => !k.effect && k.pos.is_none(),
+        };
+        if !takes {
+            return;
         }
         match self {
-            Change::Axis(..) => {}
+            Change::Axis(a, v) => {
+                if let Some(p) = &mut k.pos {
+                    p[*a] = *v;
+                }
+            }
+            Change::Value(v, lane) => {
+                k.raw_value = Some(*v);
+                k.kind = Key::effect_shape(*lane, *v);
+                k.source = None;
+            }
+            Change::Custom(name, v) => {
+                match v {
+                    Some(v) => k.extra_custom.insert(name.clone(), v.clone()),
+                    None => k.extra_custom.remove(name),
+                };
+                k.source = None;
+            }
             Change::Beat(b) => k.beat = b.max(0.0),
             Change::Kind(v) => {
                 k.kind = *v;
@@ -190,6 +211,120 @@ fn key_range(row: &Row, b0: f64, b1: f64) -> &[Key] {
     let s = row.keys.partition_point(|k| k.beat < b0);
     let e = row.keys.partition_point(|k| k.beat <= b1).max(s);
     &row.keys[s..e]
+}
+
+/// A laser-speed key's speed: Chroma's precise speed, else the event value.
+fn effect_speed(k: &Key) -> f32 {
+    ["speed", "_speed", "_preciseSpeed", "preciseSpeed"]
+        .iter()
+        .find_map(|n| k.extra_custom.get(*n).and_then(Value::as_f64))
+        .unwrap_or(k.raw_value.unwrap_or(0) as f64) as f32
+}
+
+fn effect_active(k: &Key) -> bool {
+    k.raw_value.unwrap_or(0) != 0 || effect_speed(k) > 0.0
+}
+
+/// A Chroma number on an effect key: the box adds or removes it.
+fn optional_number(ui: &mut egui::Ui, label: &str, name: String, t: &Key, inputs: &mut Vec<egui::Id>, changes: &mut Vec<Change>) {
+    ui.label(label);
+    ui.horizontal(|ui| {
+        let current = t.extra_custom.get(&name).and_then(Value::as_f64);
+        let mut on = current.is_some();
+        if ui.checkbox(&mut on, "").changed() {
+            changes.push(Change::Custom(name.clone(), on.then(|| json!(0))));
+        }
+        if let Some(mut v) = current {
+            let r = ui.add(egui::DragValue::new(&mut v).speed(0.05));
+            inputs.push(r.id);
+            if r.changed() {
+                changes.push(Change::Custom(name, Some(json!(v))));
+            }
+        }
+    });
+    ui.end_row();
+}
+
+/// The Keyframe panel for an effect key, after its Beat row.
+fn effect_fields(ui: &mut egui::Ui, lane: i64, t: &Key, v3: bool, inputs: &mut Vec<egui::Id>, changes: &mut Vec<Change>) {
+    let value = t.raw_value.unwrap_or(0);
+    let name = |n: &str| if v3 { n.to_owned() } else { format!("_{n}") };
+    match lane {
+        5 => {
+            ui.label("Color boost");
+            let mut on = value != 0;
+            if ui.checkbox(&mut on, "On").changed() {
+                changes.push(Change::Value(i64::from(on), lane));
+            }
+            ui.end_row();
+        }
+        12 | 13 => {
+            let precise = if v3 { "speed" } else { "_preciseSpeed" };
+            let existing = ["speed", "_speed", "_preciseSpeed", "preciseSpeed"].into_iter().find(|n| t.extra_custom.contains_key(*n));
+            ui.label("Speed");
+            let mut v = effect_speed(t);
+            let r = ui.add(egui::DragValue::new(&mut v).speed(0.1).range(0.0..=1000.0));
+            inputs.push(r.id);
+            if r.changed() {
+                if existing.is_none() && v.fract() == 0.0 {
+                    changes.push(Change::Value(v as i64, lane));
+                } else {
+                    // A fractional speed needs Chroma's field; the value keeps the lasers on.
+                    changes.push(Change::Custom(existing.unwrap_or(precise).to_owned(), Some(json!(v))));
+                    changes.push(Change::Value(i64::from(v > 0.0), lane));
+                }
+            }
+            ui.end_row();
+
+            let dir = name("direction");
+            ui.label("Direction");
+            let current = t.extra_custom.get(&dir).and_then(Value::as_i64);
+            let text = |d: Option<i64>| match d {
+                Some(0) => "Counter-clockwise",
+                Some(_) => "Clockwise",
+                None => "Random",
+            };
+            egui::ComboBox::from_id_salt("laser direction").selected_text(text(current)).show_ui(ui, |ui| {
+                for d in [None, Some(0), Some(1)] {
+                    if ui.selectable_label(current == d, text(d)).clicked() {
+                        changes.push(Change::Custom(dir.clone(), d.map(|v| json!(v))));
+                    }
+                }
+            });
+            ui.end_row();
+
+            let lock = if v3 { "lockRotation" } else { "_lockPosition" };
+            ui.label("Keep angle");
+            let mut on = t.extra_custom.get(lock).and_then(Value::as_bool).unwrap_or(false);
+            if ui.checkbox(&mut on, "Don't jump to a new angle").changed() {
+                changes.push(Change::Custom(lock.to_owned(), on.then(|| json!(true))));
+            }
+            ui.end_row();
+        }
+        8 | 9 => {
+            ui.label("Chroma fields").on_hover_text("Tick a box to override the game's default.");
+            ui.label("");
+            ui.end_row();
+            let fields: &[(&str, &str)] = if lane == 8 {
+                &[("Rotation", "rotation"), ("Step", "step"), ("Propagation", "prop"), ("Speed", "speed"), ("Direction", "direction")]
+            } else {
+                &[("Step", "step"), ("Speed", "speed")]
+            };
+            for (label, field) in fields {
+                optional_number(ui, label, name(field), t, inputs, changes);
+            }
+        }
+        _ => {
+            ui.label("Value");
+            let mut v = value;
+            let r = ui.add(egui::DragValue::new(&mut v).speed(0.1));
+            inputs.push(r.id);
+            if r.changed() {
+                changes.push(Change::Value(v, lane));
+            }
+            ui.end_row();
+        }
+    }
 }
 
 /// Whether the map's Info.dat names Chroma (as a requirement or suggestion).
@@ -465,7 +600,7 @@ impl App {
                 let resolve = targets.as_ref().map(|f| f as &map::Resolve);
                 bm.write_positions(resolve)
             };
-            let moves = bm.rows.iter().any(|r| !r.is_light() && !r.keys.is_empty());
+            let moves = bm.rows.iter().any(|r| r.is_motion() && !r.keys.is_empty());
             // Aim lines can fight with laser-speed events that spin the same lasers.
             let spinning = self.env_lights.as_ref().map_or(0, |el| {
                 let spb = 60.0 / self.map.as_ref().map_or(120.0, |m| m.bpm);
@@ -502,6 +637,9 @@ impl App {
         }
         self.model_gen = self.rows_gen;
         let bpm = self.bpm();
+        if let Some(bm) = &mut self.beatmap {
+            bm.sync_events();
+        }
         self.model = self.beatmap.as_ref().map(|bm| {
             LightModel::build(bm, self.env.as_ref(), &self.env_colors, bpm)
         });
@@ -624,11 +762,23 @@ impl App {
         self.next_id += 1;
         let id = self.next_id;
         let Some(bm) = &mut self.beatmap else { return };
+        let v3 = bm.names.version == "v3";
         let row = &mut bm.rows[row_idx];
-        let key = if !row.is_light() {
+        let key = if row.is_motion() {
             // Starts where the lights are at that moment, so adding a key doesn't move them.
             let easing = row.keys.iter().rev().find(|k| k.beat <= beat).and_then(|k| k.easing.clone());
             Key::line(row.kind, id, beat, row.position_at(beat), easing)
+        } else if row.is_effect() {
+            let lane = row.lane;
+            // Like the key before it; a first key turns the effect on.
+            match row.keys.iter().rev().find(|k| k.beat <= beat) {
+                Some(prev) => Key { id, beat, source: None, extra: Map::new(), ..prev.clone() },
+                None => {
+                    let mut k = Key::effect(id, beat, lane, i64::from(!matches!(lane, 8 | 9)));
+                    k.brightness_src = v3.then(|| json!(1));
+                    k
+                }
+            }
         } else { match row.keys.iter().rev().find(|k| k.beat <= beat) {
             Some(prev) => Key {
                 id,
@@ -657,6 +807,8 @@ impl App {
                 extra: Map::new(),
                 extra_custom: Map::new(),
                 pos: None,
+                effect: false,
+                source: None,
             },
         } };
         row.keys.push(key);
@@ -674,7 +826,7 @@ impl App {
         if !rows.get(i)?.is_light() {
             return None;
         }
-        (!rows[i + 1..].iter().take_while(|r| !r.is_light()).any(|r| r.kind == kind)).then_some(i)
+        (!rows[i + 1..].iter().take_while(|r| r.is_motion()).any(|r| r.kind == kind)).then_some(i)
     }
 
     fn add_line(&mut self, i: usize, kind: RowKind) {
@@ -755,7 +907,7 @@ impl App {
                 .beatmap
                 .as_mut()
                 .and_then(|bm| bm.rows.get_mut(row_idx))
-                .filter(|row| !row.is_light() == key.pos.is_some())
+                .filter(|row| row.is_motion() == key.pos.is_some())
             {
                 row.keys.push(key);
             }
@@ -797,7 +949,15 @@ impl App {
         let Some(bm) = &self.beatmap else {
             return (out, 0.0);
         };
-        for (lane, _) in map::LIGHT_LANES {
+        for lane in map::LANE_ORDER {
+            if map::is_effect_lane(*lane) {
+                // One line each, no lane header.
+                for (i, _) in bm.rows.iter().enumerate().filter(|(_, r)| r.lane == *lane) {
+                    out.push(Laid { line: Line::Row(i), y, h: ROW_H });
+                    y += ROW_H;
+                }
+                continue;
+            }
             out.push(Laid {
                 line: Line::Lane(*lane),
                 y,
@@ -1229,7 +1389,20 @@ impl App {
                         Pos2::new(tl.right(), l.y + l.h - 5.0),
                     );
                     rp.rect_filled(strip, 0.0, Color32::from_gray(14));
-                    if !row.is_light() {
+                    if row.is_effect() {
+                        // Boost on / lasers spinning: a band until the next key.
+                        if matches!(row.lane, 5 | 12 | 13) {
+                            for (i, k) in row.keys.iter().enumerate() {
+                                let x1 = row.keys.get(i + 1).map_or(tl.right(), |n| self.beat_to_x(n.beat));
+                                let x0 = self.beat_to_x(k.beat).max(tl.left());
+                                if x1 > x0 && effect_active(k) {
+                                    let level = if row.lane == 5 { 1.0 } else { (effect_speed(k) / 10.0).clamp(0.25, 1.0) };
+                                    let c = Color32::from_rgb((60.0 + 150.0 * level) as u8, (50.0 + 125.0 * level) as u8, 40);
+                                    rp.rect_filled(Rect::from_x_y_ranges(x0..=x1.min(tl.right()), strip.y_range()), 0.0, c);
+                                }
+                            }
+                        }
+                    } else if row.is_motion() {
                         // Bright while the lights move, dim while they hold.
                         let (bright, dim) = if row.kind == RowKind::Aim {
                             (Color32::from_rgb(200, 140, 60), Color32::from_rgb(85, 60, 30))
@@ -1329,7 +1502,17 @@ impl App {
                 }
                 Line::Row(i) => {
                     let row = &bm.rows[i];
-                    if !row.is_light() {
+                    if row.is_effect() {
+                        lp.text(
+                            Pos2::new(full.left() + 8.0, cy),
+                            Align2::LEFT_CENTER,
+                            format!("{}  [{}]", row.label(), row.keys.len()),
+                            font.clone(),
+                            Color32::from_rgb(225, 205, 130),
+                        );
+                        continue;
+                    }
+                    if row.is_motion() {
                         lp.text(
                             Pos2::new(full.left() + 62.0, cy),
                             Align2::LEFT_CENTER,
@@ -1614,6 +1797,15 @@ impl App {
                 ui.end_row();
             }
 
+            if t.effect {
+                let lane = self.beatmap.as_ref().and_then(|bm| {
+                    bm.rows.iter().find(|r| r.keys.iter().any(|k| k.id == t.id)).map(|r| r.lane)
+                });
+                let v3 = self.beatmap.as_ref().is_some_and(|bm| bm.names.version == "v3");
+                effect_fields(ui, lane.unwrap_or(0), &t, v3, &mut self.text_inputs, &mut changes);
+                return;
+            }
+
             if let Some(p) = t.pos {
                 let aim = self.beatmap.as_ref().is_some_and(|bm| {
                     bm.rows.iter().any(|r| r.kind == RowKind::Aim && r.keys.iter().any(|k| k.id == t.id))
@@ -1728,7 +1920,7 @@ impl App {
             ui.end_row();
         });
 
-        if !self.palette.is_empty() && t.pos.is_none() {
+        if !self.palette.is_empty() && t.pos.is_none() && !t.effect {
             ui.add_space(10.0);
             ui.label(egui::RichText::new("Colors used in this map").strong());
             ui.horizontal_wrapped(|ui| {

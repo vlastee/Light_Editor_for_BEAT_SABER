@@ -150,6 +150,10 @@ fn check_map(folder: &Path, decode_audio: bool, report: &Mutex<Report>) {
             .map(|a| a.iter().map(canonical).collect())
             .unwrap_or_default();
         let mut after: Vec<String> = bm.build_events().iter().map(canonical).collect();
+        if let Some(boosts) = bm.build_boosts() {
+            before.extend(bm.json["colorBoostBeatmapEvents"].as_array().into_iter().flatten().map(canonical));
+            after.extend(boosts.iter().map(canonical));
+        }
         before.sort();
         after.sort();
 
@@ -271,7 +275,7 @@ pub fn save_test(src: &Path, work: &Path) -> i32 {
         let before_other = bm.other_events.clone();
 
         // Edit: recolor the first key, delete the last key of that row, add a new key.
-        let row = bm.rows.iter_mut().find(|r| r.keys.len() >= 2).ok_or("no row with 2 keys")?;
+        let row = bm.rows.iter_mut().filter(|r| r.is_light()).find(|r| r.keys.len() >= 2).ok_or("no row with 2 keys")?;
         let first_beat = row.keys[0].beat;
         row.keys[0].color = Some([0.25, 0.5, 0.75, 1.0]);
         row.keys[0].color_src = None;

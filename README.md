@@ -49,12 +49,13 @@ view from the player's spot at the playhead:
   light quads blurred into the fog texture (exposure knee and ACES), fog and height fog on every
   surface and the sky, ChroMapper's lit surfaces with its five environment lights, light tubes,
   fake glows, smoke and dust particles, mirror reflections, and the post bloom. Light colors come
-  from the editor's ChroMapper-exact light model. Rotating lasers follow the laser-speed events
-  (start angles are random in ChroMapper, so they differ).
+  from the editor's ChroMapper-exact light model. Rotating lasers follow the laser-speed events,
+  and rings follow the ring spin and zoom events (random angles and directions differ from
+  ChroMapper's unless the map sets them with Chroma).
 - **Custom geometry from the map**: Chroma `environment` objects (cubes, spheres, cylinders,
   planes, quads, triangles) lit by your events and moved by `AnimateTrack`. They are drawn over the
   environment, not yet depth-tested against it.
-- Not previewed yet: ring spin and zoom, audio-driven spectrograms, Lit emission textures and the
+- Not previewed yet: audio-driven spectrograms, Lit emission textures and the
   glow-sprite and lightmap features some newer environments use, edits that move base-game
   objects, Vivify, track parenting. Without exported environments the preview falls back to a
   simple stand-in renderer.
@@ -71,6 +72,9 @@ the tutorial on [moving lights](docs/TUTORIAL.md#8-move-lights) and
 
 The exported environments are kept in `~/.local/share/bs-light-timeline/environments/`, not in
 this repository.
+
+Yellow rows show the events that aren't light colors: color boost, ring spin and zoom, laser speed,
+and special events. Their keys edit like the others, with their own settings in the Keyframe panel.
 
 Key shapes: ◆ On, ● Transition, ▲ Flash, ▼ Fade, ■ Off. A **Transition** key is blended into
 from the key before it, and that earlier key's "Easing to next" sets the curve (this is how the
