@@ -108,3 +108,9 @@ python3 -I test/refcmp.py test/out/ref/<job>
 
 renders each snapshot with ChroMapper's recorded light state and writes side-by-side images with
 the mean error (`BSLT_FROM_LIGHTS=1` derives the shader inputs from the light colors instead).
+
+## License
+
+GPL-2.0-only (see [LICENSE](LICENSE)). The light model (`src/cmlight.rs`) and the preview's
+shader math (`src/gpu3d.wgsl`) are ports of [ChroMapper](https://github.com/Caeden117/ChroMapper),
+which is licensed under GPL-2.0.
