@@ -154,6 +154,13 @@ fn check_map(folder: &Path, decode_audio: bool, report: &Mutex<Report>) {
             before.extend(bm.json["colorBoostBeatmapEvents"].as_array().into_iter().flatten().map(canonical));
             after.extend(boosts.iter().map(canonical));
         }
+        if let Some(original) = &bm.v4 {
+            // A v4 file must pack back into tables that expand to the same events.
+            let packed = crate::v4::collapse(&bm.json, original);
+            if crate::v4::fingerprint(&crate::v4::expand(&packed)) != crate::v4::fingerprint(&crate::v4::expand(original)) {
+                report.lock().unwrap().mismatches.push(format!("{name} / {}: v4 tables changed", d.name));
+            }
+        }
         before.sort();
         after.sort();
 
@@ -395,7 +402,15 @@ pub fn render(folder: &Path, diff: &str, beats: &str, out: &Path, pose: Option<&
             });
             for b in beats.split(',').filter_map(|b| b.trim().parse::<f64>().ok()) {
                 let seconds = (b * 60.0 / info.bpm) as f32;
-                let state = lights.state_at(e, &|k| model.color_keys(k.0, &k.1, b), &motion, seconds);
+                let color = |k: &(i64, Vec<i64>)| match map::group_of(k.0) {
+                    Some((_, group)) => motion.groups.color(group, k.1.first().copied().unwrap_or(0), b, &|c| model.group_color(c, b)),
+                    None => model.color_keys(k.0, &k.1, b),
+                };
+                let state = lights.state_at(e, &color, &motion, seconds);
+                if std::env::var_os("BSLT_DEBUG").is_some() {
+                    eprintln!("beat {b}: {} moved, {} shown, {} hidden", state.moved.len(), state.shown.len(), state.hidden.len());
+                }
+                let fog = motion.groups.fog(&bm, b, fog);
                 gpu.render(&crate::gpu3d::Frame { view, width: w as u32, height: h as u32, env: e, state: &state, fog, post_bloom: true });
                 crate::gpu3d::write_png(&out.join(format!("{b}.png")), w as u32, h as u32, &gpu.read_rgb())?;
             }
@@ -683,4 +698,61 @@ pub fn compare_lights(dir: &Path, jobs: &Path, out: &Path) -> i32 {
     }
     println!("(all differences: {})", out.join("mismatches.txt").display());
     0
+}
+
+/// `--compare-motion <map folder> <difficulty> <capture dir>`: at each captured beat, how far the
+/// objects ChroMapper moved (lights.jsonl "moved") are from where our motion puts them.
+pub fn compare_motion(folder: &Path, diff: &str, capture: &Path) -> i32 {
+    let run = || -> Result<(), String> {
+        let info = map::load_info(folder)?;
+        let d = info
+            .difficulties
+            .iter()
+            .filter(|d| d.name.starts_with("Standard"))
+            .find(|d| d.name.ends_with(&format!(" {diff}")))
+            .ok_or_else(|| format!("no difficulty {diff}"))?;
+        let mut id = 0;
+        let bm = map::load_beatmap(&folder.join(&d.file), &mut id)?;
+        let env = crate::environment::EnvFile::load_path(&capture.join("environment.json")).ok_or("no environment.json")?;
+        let comps = crate::envscene::EnvLights::components(capture);
+        let lights = crate::envscene::EnvLights::load(&env, capture);
+        let motion = crate::motion::Motion::new(&comps, &bm.json, info.bpm);
+        let model = crate::cmlight::LightModel::build(&bm, Some(&env), &d.colors, info.bpm);
+        let text = std::fs::read_to_string(capture.join("lights.jsonl")).map_err(|e| e.to_string())?;
+        for line in text.lines() {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            let beat = v["beat"].as_f64().unwrap_or(0.0);
+            let seconds = (beat * 60.0 / info.bpm) as f32;
+            let color = |k: &(i64, Vec<i64>)| model.color_keys(k.0, &k.1, beat);
+            let state = lights.state_at(&env, &color, &motion, seconds);
+            let (mut n, mut sum, mut worst, mut worst_path) = (0, 0.0f32, 0.0f32, String::new());
+            for m in v["moved"].as_array().into_iter().flatten() {
+                let (Some(i), Some(a)) = (m[0].as_u64(), m[1].as_array()) else { continue };
+                let i = i as usize;
+                let Some(o) = env.objects.get(i) else { continue };
+                let theirs = [3, 7, 11].map(|k| a.get(k).and_then(serde_json::Value::as_f64).unwrap_or(0.0) as f32);
+                let ours = state.moved.get(&i).copied().unwrap_or(o.matrix);
+                let e = ((ours[3] - theirs[0]).powi(2) + (ours[7] - theirs[1]).powi(2) + (ours[11] - theirs[2]).powi(2)).sqrt();
+                n += 1;
+                sum += e;
+                if std::env::var_os("BSLT_DEBUG").is_some() {
+                    let d = |m: [f32; 3]| [m[0] - o.matrix[3], m[1] - o.matrix[7], m[2] - o.matrix[11]].map(|x| (x * 1000.0).round() / 1000.0);
+                    eprintln!("  {} theirs {:?} ours {:?}", o.path, d(theirs), d([ours[3], ours[7], ours[11]]));
+                }
+                if e > worst {
+                    worst = e;
+                    worst_path = o.path.clone();
+                }
+            }
+            println!("beat {beat}: {n} moved objects, mean position error {:.4}, worst {worst:.4} ({worst_path})", if n > 0 { sum / n as f32 } else { 0.0 });
+        }
+        Ok(())
+    };
+    match run() {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("{e}");
+            1
+        }
+    }
 }

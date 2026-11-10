@@ -4,7 +4,7 @@ A Blender-style dope sheet for Beat Saber light events: one row per light lane (
 Chroma light-ID group), keyframes you click, drag and recolor, with the song's waveform
 and a live color preview strip under every row.
 
-Works on v2 and v3 difficulty files, including Chroma colors, light IDs, easings and
+Works on v2 and v3 difficulties and v4 lightshows, including Chroma colors, light IDs, easings and
 legacy Chroma RGB values. Everything it doesn't edit is written back exactly as it was.
 
 ![The editor: light lanes with keyframes over the song's waveform, and the 3D preview below](docs/images/overview.png)
@@ -41,24 +41,29 @@ The graphics driver needs Vulkan support. Developed and tested on Linux.
 The **Preview** panel at the bottom (toggle in the toolbar, drag its edge to resize) is a 3D
 view from the player's spot at the playhead:
 
-- **Environments from your ChroMapper**: run `tools/export-chromapper-envs.sh` once (podman,
+- **Environments from your ChroMapper**: run `tools/export-chromapper-envs.sh` once, and again after
+  updating the editor if a preview feature needs new data (podman,
   dotnet and ChroMapper-PropPreview needed). It opens every environment in your installed
   ChroMapper (headless, in a container) and exports its meshes, materials, textures, light IDs,
   light components, fog lights and particles.
 - **Rendered like ChroMapper**: the preview is a GPU port of ChroMapper's BloomFog rendering:
   light quads blurred into the fog texture (exposure knee and ACES), fog and height fog on every
-  surface and the sky, ChroMapper's lit surfaces with its five environment lights, light tubes,
-  fake glows, smoke and dust particles, mirror reflections, and the post bloom. Light colors come
-  from the editor's ChroMapper-exact light model. Rotating lasers follow the laser-speed events,
-  and rings follow the ring spin and zoom events (random angles and directions differ from
-  ChroMapper's unless the map sets them with Chroma).
+  surface and the sky, ChroMapper's lit surfaces with its five environment lights, glowing
+  (emissive) surfaces and flipbook screens, light tubes, glow sprites, fake glows, color-array
+  glows, smoke and dust particles, mirror reflections, and the post bloom. Light colors come
+  from the editor's ChroMapper-exact light model. Rotating and sliding lasers follow the
+  laser-speed events, and rings follow the ring spin and zoom events (random angles, directions
+  and phases differ from ChroMapper's unless the map sets them with Chroma). v3 light groups
+  (color, rotation, translation and VFX, random filters included) move and light the stage as in
+  ChroMapper, Unity constraints included.
 - **Custom geometry from the map**: Chroma `environment` objects (cubes, spheres, cylinders,
   planes, quads, triangles) lit by your events and moved by `AnimateTrack`. They are drawn over the
   environment, not yet depth-tested against it.
-- Not previewed yet: audio-driven spectrograms, Lit emission textures and the
-  glow-sprite and lightmap features some newer environments use, edits that move base-game
-  objects, Vivify, track parenting. Without exported environments the preview falls back to a
-  simple stand-in renderer.
+- Not previewed: Lizzo's balloon bursts, Pyro's fire and Interscope's car jumps and suspension.
+  ChroMapper doesn't show these either (its copies of those environments lack the parts that
+  would), and the cars are a physics simulation. Also not previewed: audio-driven spectrograms,
+  baked lightmaps, edits that move base-game objects, Vivify, track parenting. Without exported
+  environments the preview falls back to a simple stand-in renderer.
 
 Drag to look around, use the wheel to move, double-click to reset the camera.
 
@@ -74,7 +79,9 @@ The exported environments are kept in `~/.local/share/bs-light-timeline/environm
 this repository.
 
 Yellow rows show the events that aren't light colors: color boost, ring spin and zoom, laser speed,
-and special events. Their keys edit like the others, with their own settings in the Keyframe panel.
+and special events. Rows at the bottom of the timeline show v3 light groups and Chroma fog and
+component animation. Their keys edit like the others, with their own settings in the Keyframe panel.
+The **Chroma Fog** row is there in every v2 and v3 map, so you can add fog to a map that has none.
 
 Key shapes: ◆ On, ● Transition, ▲ Flash, ▼ Fade, ■ Off. A **Transition** key is blended into
 from the key before it, and that earlier key's "Easing to next" sets the curve (this is how the
@@ -128,6 +135,13 @@ python3 -I test/refcmp.py test/out/ref/<job>
 
 renders each snapshot with ChroMapper's recorded light state and writes side-by-side images with
 the mean error (`BSLT_FROM_LIGHTS=1` derives the shader inputs from the light colors instead).
+
+```bash
+cargo run --release -- --compare-motion "<map folder>" ExpertPlus test/out/ref/<job>
+```
+
+compares where ChroMapper moved each object (light groups, constraints, rotating and sliding lasers)
+with where the editor's motion puts it (`BSLT_DEBUG=1` lists every object).
 
 ## License
 

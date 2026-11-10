@@ -15,7 +15,7 @@ use wgpu::util::DeviceExt;
 
 const HDR: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 const OUTLINE_MASK: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
-const DEPTH: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+const DEPTH: wgpu::TextureFormat = wgpu::TextureFormat::Depth24PlusStencil8;
 pub const OUTPUT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// ChroMapper's `bloomFogResolution` and fog frustum (BloomfogRendererSO: 130° x 130°).
 const FOG_SIZE: u32 = 512;
@@ -172,12 +172,32 @@ pub struct Block {
     pub alpha_width: Option<[f32; 4]>,
     pub size_params: Option<[f32; 4]>,
     pub emission_tex_color: Option<[f32; 4]>,
+    /// Lit `_EmissionColor` (vertex emission).
+    pub emission_color: Option<[f32; 4]>,
+    /// Flipbook `_StartTime` and `_TimeOffset` (seconds).
+    pub start_time: Option<f32>,
+    pub time_offset: Option<f32>,
+    /// `_ColorsArrayOffset` into the material's color array.
+    pub colors_offset: Option<f32>,
+    /// SpriteRenderer color (sprite lights), linear rgb.
+    pub renderer_color: Option<[f32; 4]>,
     pub enabled: bool,
 }
 
 impl Default for Block {
     fn default() -> Self {
-        Block { color: None, alpha_width: None, size_params: None, emission_tex_color: None, enabled: true }
+        Block {
+            color: None,
+            alpha_width: None,
+            size_params: None,
+            emission_tex_color: None,
+            emission_color: None,
+            start_time: None,
+            time_offset: None,
+            colors_offset: None,
+            renderer_color: None,
+            enabled: true,
+        }
     }
 }
 
@@ -195,9 +215,21 @@ pub struct SceneState {
     pub mirror_plane: Option<[f32; 4]>,
     /// Particle system index → its particles this frame (else the exported ones).
     pub particles: HashMap<usize, Vec<crate::environment::Particle>>,
+    /// Objects shown or hidden regardless of the exported state (special events).
+    pub shown: HashSet<usize>,
+    pub hidden: HashSet<usize>,
     /// Object indices to outline in white, and the outline's width in pixels.
     pub outline: Vec<usize>,
     pub outline_px: f32,
+    /// Song time in seconds (flipbooks).
+    pub time: f32,
+    /// `_BaseColorBoost`, `_BaseColorBoostThreshold` (white boost).
+    pub base_boost: [f32; 2],
+    /// Material index → its `_ColorsArray` (ColorArrayLightsController, linear colors).
+    pub color_arrays: HashMap<usize, Vec<[f32; 4]>>,
+    /// Particles drawn this frame besides the environment's systems (event bursts): material, the
+    /// system's matrix, whether positions are local, and the particles.
+    pub extra_particles: Vec<(usize, [f32; 16], bool, Vec<crate::environment::Particle>)>,
 }
 
 pub struct Frame<'a> {
@@ -217,6 +249,7 @@ struct Vertex {
     normal: [f32; 3],
     uv: [f32; 2],
     color: [f32; 4],
+    uv2: [f32; 2],
 }
 
 #[repr(C)]
@@ -247,6 +280,8 @@ struct Globals {
     clip: [f32; 4],
     /// x: clip on, y: mirrored winding.
     flags: [f32; 4],
+    /// Song seconds, base color boost, its threshold.
+    misc: [f32; 4],
 }
 
 #[repr(C)]
@@ -255,7 +290,7 @@ struct ObjectData {
     model: [[f32; 4]; 4],
     normal: [[f32; 4]; 4],
     info: [u32; 4],
-    b: [[f32; 4]; 4],
+    b: [[f32; 4]; 7],
     p: [[f32; 4]; 12],
 }
 
@@ -275,6 +310,7 @@ pub enum Kind {
     Mirror = 4,
     Spectrogram = 5,
     Particles = 6,
+    SliceBillboard = 7,
 }
 
 const F_DIFFUSE: u32 = 1;
@@ -294,12 +330,35 @@ const F_FOG_COLOR: u32 = 8192;
 const F_FOG_ALPHA: u32 = 16384;
 const F_FOG_LERP: u32 = 32768;
 const F_WHITEBOOST_MAIN: u32 = 65536;
+const F_USE_FOG_FOR_LIGHTS: u32 = 1 << 17;
+const F_ANGLE_DISAPPEAR: u32 = 1 << 18;
+const F_Y_BILLBOARD: u32 = 1 << 19;
+const F_ALPHA_WIDTH_SCALE: u32 = 1 << 20;
+const F_WHITEBOOST_ALWAYS: u32 = 1 << 21;
+const F_VERTEX_EMISSION: u32 = 1 << 22;
+const F_EMISSION_FLIPBOOK: u32 = 1 << 23;
+const F_COLOR_ARRAY: u32 = 1 << 24;
+const F_TEXTURE_FLIPBOOK: u32 = 1 << 25;
+const F_FLIPBOOK_NOBLEND: u32 = 1 << 26;
+const F_SPECTROGRAM_COLOR: u32 = 1 << 27;
+
+/// A material's stencil test and write: Unity's CompareFunction and StencilOp numbers, and whether it
+/// draws color (ChroMapper/Stencil only writes the mask).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct StencilKey {
+    comp: u32,
+    pass: u32,
+    color: bool,
+}
 
 struct GpuMaterial {
+    stencil: Option<(u32, StencilKey)>,
     kind: Kind,
     flags: u32,
     p: [[f32; 4]; 12],
     color: [f32; 4],
+    /// `_EmissionColor` (linear).
+    emission_color: [f32; 4],
     additive: bool,
     queue: i64,
     bind: wgpu::BindGroup,
@@ -399,10 +458,15 @@ pub struct Gpu3d {
     env_key: usize,
     meshes: Vec<GpuMesh>,
     materials: Vec<GpuMaterial>,
+    /// Per object: a material with its sprite's texture in place of `_MainTex` (SpriteRenderers).
+    object_materials: Vec<Option<usize>>,
     mask: wgpu::TextureView,
     targets: Option<Targets>,
     objects: wgpu::Buffer,
     objects_cap: usize,
+    /// Every material's color array, flattened (the first 150 entries stay zero).
+    colors: wgpu::Buffer,
+    colors_cap: usize,
     clamp_sampler: wgpu::Sampler,
     repeat_sampler: wgpu::Sampler,
     scene_layout: wgpu::BindGroupLayout,
@@ -411,6 +475,10 @@ pub struct Gpu3d {
     mat_layout: wgpu::BindGroupLayout,
     pass_layout: wgpu::BindGroupLayout,
     pipes: Pipelines,
+    /// Mesh pipelines for materials with stencil state (Lattice's runway mask), built per environment.
+    shader: wgpu::ShaderModule,
+    mesh_layout: wgpu::PipelineLayout,
+    stencil_pipes: HashMap<(StencilKey, bool, bool), wgpu::RenderPipeline>,
     white: wgpu::TextureView,
     black: wgpu::TextureView,
 }
@@ -536,6 +604,16 @@ impl Gpu3d {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         // One texture + sampler (the fog texture for meshes, the mask for light quads).
@@ -569,7 +647,7 @@ impl Gpu3d {
         let mesh_vertex = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Vertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4],
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4, 4 => Float32x2],
         };
         let quad_vertex = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<QuadVertex>() as u64,
@@ -650,6 +728,13 @@ impl Gpu3d {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let colors_cap = COLOR_ARRAY_LEN * 4;
+        let colors = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("color arrays"),
+            size: (colors_cap * 16) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let sampler = |mode: wgpu::AddressMode| {
             device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("sampler"),
@@ -689,15 +774,21 @@ impl Gpu3d {
             env_key: 0,
             meshes: Vec::new(),
             materials: Vec::new(),
+            object_materials: Vec::new(),
             targets: None,
             objects,
             objects_cap,
+            colors,
+            colors_cap,
             scene_layout,
             tex2_layout,
             fogtex_layout,
             mat_layout,
             pass_layout,
             pipes,
+            shader,
+            mesh_layout,
+            stencil_pipes: HashMap::new(),
             white,
             black,
         }
@@ -771,9 +862,10 @@ impl Gpu3d {
                         normal: m.normal.get(i).copied().unwrap_or([0.0, 1.0, 0.0]),
                         uv: m.uv.get(i).copied().unwrap_or([0.0, 0.0]),
                         color: m.color.get(i).copied().unwrap_or([1.0; 4]),
+                        uv2: m.uv2.get(i).copied().unwrap_or([0.0, 0.0]),
                     })
                     .collect();
-                let verts = if verts.is_empty() { vec![Vertex { pos: [0.0; 3], normal: [0.0; 3], uv: [0.0; 2], color: [0.0; 4] }] } else { verts };
+                let verts = if verts.is_empty() { vec![Vertex { pos: [0.0; 3], normal: [0.0; 3], uv: [0.0; 2], color: [0.0; 4], uv2: [0.0; 2] }] } else { verts };
                 let idx = if m.idx.is_empty() { vec![0u32, 0, 0] } else { m.idx.clone() };
                 GpuMesh {
                     vb: self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -804,12 +896,122 @@ impl Gpu3d {
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.repeat_sampler) },
                 ],
             });
-            materials.push(GpuMaterial { kind, flags, p, color, additive, queue: m.queue, bind });
+            let e = m.vec4("_EmissionColor", [1.0, 1.0, 1.0, 0.0]);
+            let emission_color = if m.colors.iter().any(|n| n == "_EmissionColor") {
+                [srgb_to_linear(e[0]), srgb_to_linear(e[1]), srgb_to_linear(e[2]), e[3]]
+            } else {
+                e
+            };
+            let comp = m.float("_StencilComp", 8.0) as u32;
+            let pass = m.float("_StencilPass", 0.0) as u32;
+            let mask_only = m.shader == "ChroMapper/Stencil";
+            let stencil = (mask_only || (comp != 8 && comp != 0) || pass != 0)
+                .then(|| (m.float("_StencilRefValue", 0.0) as u32, StencilKey { comp, pass, color: !mask_only }));
+            materials.push(GpuMaterial { stencil, kind, flags, p, color, emission_color, additive: additive && !mask_only, queue: m.queue, bind });
+        }
+        // Sprites bring their own texture: one material copy per (material, sprite texture).
+        let mut variants: HashMap<(usize, String), usize> = HashMap::new();
+        let mut object_materials = Vec::with_capacity(env.objects.len());
+        for o in &env.objects {
+            let base = o.materials.first().and_then(|m| usize::try_from(*m).ok()).filter(|m| *m < materials.len());
+            let variant = match (base, &o.sprite_tex) {
+                (Some(mi), Some(key)) => {
+                    if let Some(&v) = variants.get(&(mi, key.clone())) {
+                        Some(v)
+                    } else if let Some(view0) = tex(key) {
+                        let (.., t1) = material_params(&env.materials[mi]);
+                        let v1 = t1.and_then(|k| tex(&k)).unwrap_or_else(|| self.white.clone());
+                        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("sprite material"),
+                            layout: &self.mat_layout,
+                            entries: &[
+                                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view0) },
+                                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&v1) },
+                                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.repeat_sampler) },
+                            ],
+                        });
+                        let b = &materials[mi];
+                        let m = GpuMaterial { stencil: b.stencil, kind: b.kind, flags: b.flags, p: b.p, color: b.color, emission_color: b.emission_color, additive: b.additive, queue: b.queue, bind };
+                        materials.push(m);
+                        variants.insert((mi, key.clone()), materials.len() - 1);
+                        Some(materials.len() - 1)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            object_materials.push(variant);
+        }
+        self.object_materials = object_materials;
+        let keys: HashSet<(StencilKey, bool)> = materials.iter().filter_map(|m| m.stencil.map(|(_, k)| (k, m.additive))).collect();
+        for (key, additive) in keys {
+            for mirror in [false, true] {
+                let pipe = self.stencil_pipeline(key, additive, mirror);
+                self.stencil_pipes.insert((key, additive, mirror), pipe);
+            }
         }
         let mask = mask.unwrap_or_else(|| self.white.clone());
         self.meshes = meshes;
         self.materials = materials;
         self.mask = mask;
+    }
+
+    /// A mesh pipeline with a material's stencil state.
+    fn stencil_pipeline(&self, key: StencilKey, additive: bool, mirror: bool) -> wgpu::RenderPipeline {
+        let compare = match key.comp {
+            1 => wgpu::CompareFunction::Never,
+            2 => wgpu::CompareFunction::Less,
+            3 => wgpu::CompareFunction::Equal,
+            4 => wgpu::CompareFunction::LessEqual,
+            5 => wgpu::CompareFunction::Greater,
+            6 => wgpu::CompareFunction::NotEqual,
+            7 => wgpu::CompareFunction::GreaterEqual,
+            _ => wgpu::CompareFunction::Always,
+        };
+        let op = match key.pass {
+            1 => wgpu::StencilOperation::Zero,
+            2 => wgpu::StencilOperation::Replace,
+            3 => wgpu::StencilOperation::IncrementClamp,
+            4 => wgpu::StencilOperation::DecrementClamp,
+            5 => wgpu::StencilOperation::Invert,
+            6 => wgpu::StencilOperation::IncrementWrap,
+            7 => wgpu::StencilOperation::DecrementWrap,
+            _ => wgpu::StencilOperation::Keep,
+        };
+        let face = wgpu::StencilFaceState { compare, fail_op: wgpu::StencilOperation::Keep, depth_fail_op: wgpu::StencilOperation::Keep, pass_op: op };
+        let add = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
+        let mesh_vertex = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Vertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4, 4 => Float32x2],
+        };
+        self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("mesh stencil"),
+            layout: Some(&self.mesh_layout),
+            vertex: wgpu::VertexState { module: &self.shader, entry_point: Some("vs_mesh"), compilation_options: Default::default(), buffers: &[Some(mesh_vertex)] },
+            fragment: Some(wgpu::FragmentState {
+                module: &self.shader,
+                entry_point: Some("fs_mesh"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: if mirror { OUTPUT } else { HDR },
+                    blend: additive.then_some(wgpu::BlendState { color: add, alpha: add }),
+                    write_mask: if key.color { wgpu::ColorWrites::ALL } else { wgpu::ColorWrites::empty() },
+                })],
+            }),
+            primitive: wgpu::PrimitiveState { cull_mode: None, front_face: wgpu::FrontFace::Cw, ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH,
+                depth_write_enabled: Some(!additive && key.color),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: wgpu::StencilState { front: face, back: face, read_mask: 0xff, write_mask: 0xff },
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        })
     }
 
     fn ensure_targets(&mut self, w: u32, h: u32) {
@@ -882,6 +1084,7 @@ impl Gpu3d {
             light_radius: [[l.radius[0], l.radius[1], l.radius[2], l.radius[3]], [l.radius[4], 0.0, 0.0, 0.0]],
             clip: clip.unwrap_or([0.0; 4]),
             flags: [if clip.is_some() { 1.0 } else { 0.0 }, if clip.is_some() { 1.0 } else { 0.0 }, 0.0, 0.0],
+            misc: [f.state.time, f.state.base_boost[0], f.state.base_boost[1], 0.0],
         };
         (g, pfx, pfy)
     }
@@ -898,6 +1101,7 @@ impl Gpu3d {
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: self.objects.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.colors.as_entire_binding() },
             ],
         })
     }
@@ -1047,17 +1251,26 @@ impl Gpu3d {
     }
 
     /// Particle systems as world-space triangles for a view (billboards face it).
-    fn particle_vertices(&self, f: &Frame, v: &View, systems: &[(usize, u32, usize)]) -> (Vec<Vertex>, Vec<(u32, std::ops::Range<u32>, usize)>) {
+    fn particle_vertices(&self, f: &Frame, v: &View, systems: &[(SysRef, u32, usize)]) -> (Vec<Vertex>, Vec<(u32, std::ops::Range<u32>, usize)>) {
         let mut pverts: Vec<Vertex> = Vec::new();
         let mut pdraws = Vec::new();
-        for &(si, object, mi) in systems {
-            let ps = &f.env.particle_systems[si];
-            let particles = f.state.particles.get(&si).unwrap_or(&ps.particles);
+        for &(sys, object, mi) in systems {
+            let (particles, local, matrix, mesh) = match sys {
+                SysRef::Env(si) => {
+                    let ps = &f.env.particle_systems[si];
+                    (f.state.particles.get(&si).unwrap_or(&ps.particles), ps.local, ps.matrix, ps.mesh)
+                }
+                SysRef::Extra(i) => {
+                    let e = &f.state.extra_particles[i];
+                    (&e.3, e.2, e.1, None)
+                }
+            };
+            let ps = PsView { local, matrix };
             let start = pverts.len() as u32;
             for pt in particles {
                 let color = [srgb_to_linear(pt.color[0]), srgb_to_linear(pt.color[1]), srgb_to_linear(pt.color[2]), pt.color[3]];
                 let center = if ps.local { crate::environment::transform_point(&ps.matrix, pt.pos) } else { pt.pos };
-                match ps.mesh.and_then(|m| f.env.meshes.get(m)) {
+                match mesh.and_then(|m| f.env.meshes.get(m)) {
                     Some(mesh) => {
                         let (x, y, z) = (pt.rot[0].to_radians(), pt.rot[1].to_radians(), pt.rot[2].to_radians());
                         let rot = |p: V3| -> V3 {
@@ -1075,7 +1288,7 @@ impl Gpu3d {
                             } else {
                                 [center[0] + local[0], center[1] + local[1], center[2] + local[2]]
                             };
-                            pverts.push(Vertex { pos: wp, normal: [0.0; 3], uv: mesh.uv.get(i as usize).copied().unwrap_or([0.0; 2]), color });
+                            pverts.push(Vertex { pos: wp, normal: [0.0; 3], uv: mesh.uv.get(i as usize).copied().unwrap_or([0.0; 2]), color, uv2: mesh.uv2.get(i as usize).copied().unwrap_or([0.0; 2]) });
                         }
                     }
                     None => {
@@ -1088,7 +1301,7 @@ impl Gpu3d {
                         let q = [(-0.5, -0.5, 0.0, 0.0), (0.5, -0.5, 1.0, 0.0), (0.5, 0.5, 1.0, 1.0), (-0.5, 0.5, 0.0, 1.0)];
                         for k in [0, 1, 2, 2, 3, 0] {
                             let (x, y, u, w) = q[k];
-                            pverts.push(Vertex { pos: corner(x, y), normal: [0.0; 3], uv: [u, w], color });
+                            pverts.push(Vertex { pos: corner(x, y), normal: [0.0; 3], uv: [u, w], color, uv2: [0.0; 2] });
                         }
                     }
                 }
@@ -1143,7 +1356,7 @@ impl Gpu3d {
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: depth,
                 depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
-                stencil_ops: None,
+                stencil_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0), store: wgpu::StoreOp::Store }),
             }),
             ..Default::default()
         });
@@ -1170,7 +1383,13 @@ impl Gpu3d {
             if m.count == 0 {
                 continue;
             }
-            pass.set_pipeline(if d.additive { add } else { opaque });
+            match mat.stencil.and_then(|(r, k)| self.stencil_pipes.get(&(k, d.additive, mirror_view)).map(|p| (r, p))) {
+                Some((reference, pipe)) => {
+                    pass.set_pipeline(pipe);
+                    pass.set_stencil_reference(reference);
+                }
+                None => pass.set_pipeline(if d.additive { add } else { opaque }),
+            }
             pass.set_bind_group(2, &mat.bind, &[]);
             pass.set_vertex_buffer(0, m.vb.slice(..));
             pass.set_index_buffer(m.ib.slice(..), wgpu::IndexFormat::Uint32);
@@ -1193,15 +1412,37 @@ impl Gpu3d {
     pub fn render(&mut self, f: &Frame) -> &wgpu::Texture {
         let (w, h) = (f.width.max(1), f.height.max(1));
         self.ensure_targets(w, h);
+        // Color arrays, after 150 zero entries for materials without one.
+        let mut colors: Vec<[f32; 4]> = vec![[0.0; 4]; COLOR_ARRAY_LEN];
+        let mut color_base: HashMap<usize, usize> = HashMap::new();
+        let mut arrays: Vec<_> = f.state.color_arrays.iter().collect();
+        arrays.sort_by_key(|(k, _)| **k);
+        for (mi, arr) in arrays {
+            color_base.insert(*mi, colors.len());
+            colors.extend(arr.iter().copied());
+            colors.extend(std::iter::repeat_n([0.0; 4], COLOR_ARRAY_LEN.saturating_sub(arr.len())));
+        }
+        if colors.len() > self.colors_cap {
+            self.colors_cap = colors.len().next_power_of_two();
+            self.colors = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("color arrays"),
+                size: (self.colors_cap * 16) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        self.queue.write_buffer(&self.colors, 0, bytemuck::cast_slice(&colors));
         // Objects (shared by the main and reflected views).
         let mut data = Vec::new();
         let mut items = Vec::new();
         let outline: HashSet<usize> = f.state.outline.iter().copied().collect();
         let mut outlined = Vec::new();
         for (i, o) in f.env.objects.iter().enumerate() {
-            let (Some(mesh), true) = (o.mesh, o.enabled) else { continue };
+            let visible = (o.enabled || f.state.shown.contains(&i)) && !f.state.hidden.contains(&i);
+            let (Some(mesh), true) = (o.mesh, visible) else { continue };
             let Some(mi) = o.materials.first().and_then(|m| usize::try_from(*m).ok()).filter(|m| *m < self.materials.len()) else { continue };
-            let mat = &self.materials[mi];
+            let draw_mi = self.object_materials.get(i).copied().flatten().unwrap_or(mi);
+            let mat = &self.materials[draw_mi];
             let block = f.state.blocks.get(&i).copied().unwrap_or_default();
             if !block.enabled {
                 continue;
@@ -1211,7 +1452,7 @@ impl Gpu3d {
             if outline.contains(&i) {
                 outlined.push((data.len() as u32, mesh));
             }
-            items.push(DrawItem { reflect, object: data.len() as u32, mesh, material: mi, additive: mat.additive, queue: mat.queue });
+            items.push(DrawItem { reflect, object: data.len() as u32, mesh, material: draw_mi, additive: mat.additive, queue: mat.queue });
             data.push(ObjectData {
                 model: mat_rows_to_cols(&matrix),
                 normal: normal_matrix(&matrix),
@@ -1221,6 +1462,14 @@ impl Gpu3d {
                     block.alpha_width.unwrap_or([1.0; 4]),
                     block.size_params.unwrap_or([1.0, 1.0, 1.0, 0.0]),
                     block.emission_tex_color.unwrap_or([0.0; 4]),
+                    block.emission_color.unwrap_or(mat.emission_color),
+                    [
+                        block.start_time.unwrap_or(-1000.0),
+                        color_base.get(&mi).copied().unwrap_or(0) as f32 + block.colors_offset.unwrap_or(0.0),
+                        block.time_offset.unwrap_or(0.0),
+                        0.0,
+                    ],
+                    block.renderer_color.or(o.sprite_color).unwrap_or([1.0; 4]),
                 ],
                 p: mat.p,
             });
@@ -1234,12 +1483,23 @@ impl Gpu3d {
                 continue;
             }
             let mat = &self.materials[mi];
-            systems.push((si, data.len() as u32, mi));
+            systems.push((SysRef::Env(si), data.len() as u32, mi));
             data.push(ObjectData {
                 model: mat_rows_to_cols(&identity),
                 normal: normal_matrix(&identity),
                 info: [mat.kind as u32, mat.flags, 0, 0],
-                b: [mat.color, [1.0; 4], [1.0, 1.0, 1.0, 0.0], [0.0; 4]],
+                b: [mat.color, [1.0; 4], [1.0, 1.0, 1.0, 0.0], [0.0; 4], mat.emission_color, [-1000.0, 0.0, 0.0, 0.0], [1.0; 4]],
+                p: mat.p,
+            });
+        }
+        for (i, (mi, ..)) in f.state.extra_particles.iter().enumerate() {
+            let Some(mat) = self.materials.get(*mi) else { continue };
+            systems.push((SysRef::Extra(i), data.len() as u32, *mi));
+            data.push(ObjectData {
+                model: mat_rows_to_cols(&identity),
+                normal: normal_matrix(&identity),
+                info: [mat.kind as u32, mat.flags, 0, 0],
+                b: [mat.color, [1.0; 4], [1.0, 1.0, 1.0, 0.0], [0.0; 4], mat.emission_color, [-1000.0, 0.0, 0.0, 0.0], [1.0; 4]],
                 p: mat.p,
             });
         }
@@ -1434,6 +1694,21 @@ impl Gpu3d {
     }
 }
 
+/// A particle system drawn this frame: one of the environment's, or an event burst.
+#[derive(Clone, Copy)]
+enum SysRef {
+    Env(usize),
+    Extra(usize),
+}
+
+struct PsView {
+    local: bool,
+    matrix: [f32; 16],
+}
+
+/// Entries in a ColorArrayLightsController's `_ColorsArray`.
+const COLOR_ARRAY_LEN: usize = 150;
+
 /// GPU parameters for a material (see the layouts in gpu3d.wgsl).
 #[allow(clippy::type_complexity)]
 fn material_params(m: &EnvMaterial) -> (Kind, u32, [[f32; 4]; 12], [f32; 4], bool, bool, Option<String>, Option<String>) {
@@ -1472,6 +1747,17 @@ fn material_params(m: &EnvMaterial) -> (Kind, u32, [[f32; 4]; 12], [f32; 4], boo
     kw("_FOGTYPE_LERP", F_FOG_LERP, &mut flags);
     kw("_WHITEBOOSTTYPE_MAINEFFECT", F_WHITEBOOST_MAIN, &mut flags);
     kw("VERTEX_COLOR", F_VERTEX_COLOR, &mut flags);
+    kw("USE_FOG_FOR_LIGHTS", F_USE_FOG_FOR_LIGHTS, &mut flags);
+    kw("ANGLE_DISAPPEAR", F_ANGLE_DISAPPEAR, &mut flags);
+    kw("Y_AXIS_BILLBOARD", F_Y_BILLBOARD, &mut flags);
+    kw("ALPHA_WIDTH_SCALE", F_ALPHA_WIDTH_SCALE, &mut flags);
+    kw("_WHITEBOOSTTYPE_ALWAYS", F_WHITEBOOST_ALWAYS, &mut flags);
+    kw("_VERTEXMODE_EMISSION", F_VERTEX_EMISSION, &mut flags);
+    kw("_EMISSIONTEXTURE_FLIPBOOK", F_EMISSION_FLIPBOOK, &mut flags);
+    kw("COLOR_ARRAY", F_COLOR_ARRAY, &mut flags);
+    kw("TEXTURE_FLIPBOOK", F_TEXTURE_FLIPBOOK, &mut flags);
+    kw("FLIPBOOK_BLENDING_OFF", F_FLIPBOOK_NOBLEND, &mut flags);
+    kw("SPECTROGRAM_COLOR", F_SPECTROGRAM_COLOR, &mut flags);
     p[3] = [f("_FogStartOffset", 0.0), f("_FogScale", 1.0), f("_FogHeightScale", 1.0), f("_FogHeightOffset", 0.0)];
     let color = lin("_Color", [0.5, 0.5, 0.5, 1.0]);
     let (kind, additive, depth_write, t0, t1) = match m.shader.as_str() {
@@ -1494,7 +1780,15 @@ fn material_params(m: &EnvMaterial) -> (Kind, u32, [[f32; 4]; 12], [f32; 4], boo
             p[1] = [f("_AlphaMultiplier", 1.0), f("_Intensity", 1.0), f("_BloomMultiplier", 1.0), 0.0];
             p[4] = [f("_BlendModeSrcA", 0.0), f("_BlendModeDst", 1.0), 0.0, 0.0];
             p[5] = m.vec4("_MainTex_ST", [1.0, 1.0, 0.0, 0.0]);
+            p[6] = [f("_FlipbookColumns", 8.0), f("_FlipbookRows", 8.0), f("_FlipbookNonloopableFrames", 0.0), f("_FlipbookSpeed", 1.0)];
             (Kind::Particles, f("_BlendModeDst", 1.0) >= 0.5, false, tex("_MainTex"), None)
+        }
+        "ChroMapper/Parametric Slice Billboard" => {
+            p[1] = [f("_CapUVSize", 0.25), f("_BloomMultiplier", 1.0), f("_BloomWhiteMultiplier", 1.0), 0.0];
+            if m.float("_EnableEmissionAngleDisappear", 0.0) > 0.5 {
+                flags |= F_ANGLE_DISAPPEAR;
+            }
+            (Kind::SliceBillboard, true, false, tex("_MainTex"), None)
         }
         "ChroMapper/Spectrogram" => {
             p[0] = m.vec4("_Color", [0.5; 4]);
@@ -1510,6 +1804,8 @@ fn material_params(m: &EnvMaterial) -> (Kind, u32, [[f32; 4]; 12], [f32; 4], boo
             p[4] = [f("_BlendModeSrcA", 0.0), f("_BlendModeDst", 0.0), 0.0, f("_EmissionBrightness", 1.0)];
             p[5] = m.vec4("_EmissionTex_ST", [1.0, 1.0, 0.0, 0.0]);
             p[6] = [f("_EmissionTexBloomIntensity", 1.0), f("_MainEffectFogSuppression", 0.0), f("_EmissionTexSpeed", 0.0), 0.0];
+            p[7] = [f("_EmissionThreshold", 0.0), f("_EmissionStrength", 1.0), f("_EmissionBloomIntensity", 1.0), 0.0];
+            p[8] = [f("_FlipbookColumns", 8.0), f("_FlipbookRows", 8.0), f("_FlipbookNonloopableFrames", 0.0), f("_FlipbookSpeed", 1.0)];
             let additive = f("_BlendModeDst", 0.0) >= 0.5;
             (Kind::Lit, additive, f("_ZWrite", 1.0) >= 0.5, tex("_EmissionTex"), None)
         }

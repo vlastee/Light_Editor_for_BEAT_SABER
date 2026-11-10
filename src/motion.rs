@@ -6,14 +6,14 @@ use serde_json::Value;
 
 type M4 = [f32; 16];
 
-fn mul(a: &M4, b: &M4) -> M4 {
+pub fn mul(a: &M4, b: &M4) -> M4 {
     std::array::from_fn(|i| {
         let (r, c) = (i / 4, i % 4);
         (0..4).map(|k| a[r * 4 + k] * b[k * 4 + c]).sum()
     })
 }
 
-fn invert(m: &M4) -> M4 {
+pub fn invert(m: &M4) -> M4 {
     let a = |r: usize, c: usize| m[r * 4 + c] as f64;
     let mut inv = [0f64; 16];
     for r in 0..4 {
@@ -113,6 +113,74 @@ struct Pair {
     events: Vec<Event>,
 }
 
+/// LightPairSinMoveEffect: two transforms sliding between two offsets along a sine.
+struct SinPair {
+    paths: [String; 2],
+    /// Parent world matrices (local offsets become world moves).
+    parents: [M4; 2],
+    start_offset: [f32; 3],
+    end_offset: [f32; 3],
+    value_offset: f32,
+    override_random: bool,
+    types: [i64; 3],
+    seed: u64,
+    events: Vec<Event>,
+}
+
+impl SinPair {
+    /// Local offset of a side (1 left, -1 right) at a phase.
+    fn offset(&self, phase: f32, side: f32) -> [f32; 3] {
+        let t = phase.sin() * 0.5 + 0.5;
+        let mut v: [f32; 3] = std::array::from_fn(|k| self.start_offset[k] + (self.end_offset[k] - self.start_offset[k]) * t);
+        v[0] *= side;
+        v
+    }
+
+    /// Left and right phases at `seconds` (ChroMapper's snapshots; random phases are deterministic here).
+    fn phases(&self, seconds: f32) -> [f32; 2] {
+        let off = self.value_offset;
+        let (mut lp, mut rp, mut ls, mut rs, mut le, mut re) = (off, off, 0.0f32, 0.0f32, false, false);
+        let mut over = self.override_random;
+        let mut switch_count = 1;
+        let mut last = 0.0f32;
+        for e in self.events.iter().take_while(|e| e.seconds <= seconds) {
+            let dt = e.seconds - last;
+            lp += if le { ls * dt } else { 0.0 };
+            rp += if re { rs * dt } else { 0.0 };
+            last = e.seconds;
+            let random_phase = |o: bool, salt: u64| if o { 0.0 } else { random(self.seed ^ ((e.beat_bits as u64) << 16) ^ salt) * std::f32::consts::TAU };
+            if e.ty == self.types[2] {
+                over = switch_count % 2 == 1;
+                switch_count += 1;
+                let r = random_phase(over, 0x5157);
+                lp = r + off;
+                rp = r + off;
+                ls = ls.abs();
+                rs = ls.abs();
+                continue;
+            }
+            let r = random_phase(over, 0x9e37);
+            let apply = |phase: &mut f32, speed: &mut f32, enabled: &mut bool, offset: f32| {
+                if e.value == 0 {
+                    *enabled = false;
+                    *phase = off;
+                } else if e.value > 0 {
+                    *enabled = true;
+                    *phase = offset + off;
+                    *speed = e.value as f32;
+                }
+            };
+            if e.ty == self.types[0] {
+                apply(&mut lp, &mut ls, &mut le, r);
+            } else if e.ty == self.types[1] {
+                apply(&mut rp, &mut rs, &mut re, -r);
+            }
+        }
+        let dt = seconds - last;
+        [lp + if le { ls * dt } else { 0.0 }, rp + if re { rs * dt } else { 0.0 }]
+    }
+}
+
 struct Single {
     pivot: usize,
     mul: f32,
@@ -125,7 +193,40 @@ pub struct Motion {
     pivots: Vec<Pivot>,
     pairs: Vec<Pair>,
     singles: Vec<Single>,
+    sin_pairs: Vec<SinPair>,
     rings: Vec<RingSystem>,
+    bpm: f64,
+    /// (beat, value) of special events by type, and boost on/off by beat.
+    specials: std::collections::HashMap<i64, Vec<(f64, i64)>>,
+    boosts: Vec<(f64, bool)>,
+    /// v3 light groups and Chroma fog.
+    pub groups: crate::groups::GroupLights,
+}
+
+/// A transform's world move when its local rotation becomes `degrees` around one axis.
+pub fn local_rotation_delta(m0: &M4, parent: &M4, axis: i64, degrees: f32) -> M4 {
+    let inv_parent = invert(parent);
+    let l = mul(&inv_parent, m0);
+    let length = |c: usize| (l[c] * l[c] + l[4 + c] * l[4 + c] + l[8 + c] * l[8 + c]).sqrt();
+    let scale: M4 = std::array::from_fn(|i| match i {
+        0 => length(0),
+        5 => length(1),
+        10 => length(2),
+        15 => 1.0,
+        _ => 0.0,
+    });
+    let mut angles = [0.0; 3];
+    angles[axis.clamp(0, 2) as usize] = degrees;
+    let mut local = mul(&euler(angles), &scale);
+    (local[3], local[7], local[11]) = (l[3], l[7], l[11]);
+    mul(&mul(parent, &local), &invert(m0))
+}
+
+/// A transform's world move when its local position along one axis becomes `value`.
+pub fn local_translation_delta(m0: &M4, parent: &M4, axis: i64, value: f32) -> M4 {
+    let mut local = mul(&invert(parent), m0);
+    local[3 + 4 * axis.clamp(0, 2) as usize] = value;
+    mul(&mul(parent, &local), &invert(m0))
 }
 
 /// Beat Saber's fixed physics step, which ring motion follows.
@@ -239,6 +340,26 @@ fn simulate_ring_zoom(start: &[f32], offsets: &[f32], events: &[(i32, f32, f32)]
     out
 }
 
+/// Special events (types 16-19, 40-43) and boost changes, in time order.
+fn read_specials(json: &Value) -> (std::collections::HashMap<i64, Vec<(f64, i64)>>, Vec<(f64, bool)>) {
+    let v3 = json["basicBeatmapEvents"].as_array();
+    let mut specials: std::collections::HashMap<i64, Vec<(f64, i64)>> = Default::default();
+    let mut boosts = Vec::new();
+    for e in v3.or(json["_events"].as_array()).into_iter().flatten() {
+        let (b, t, v) = if v3.is_some() { (e["b"].as_f64(), e["et"].as_i64(), e["i"].as_i64()) } else { (e["_time"].as_f64(), e["_type"].as_i64(), e["_value"].as_i64()) };
+        let (b, t, v) = (b.unwrap_or(0.0), t.unwrap_or(0), v.unwrap_or(0));
+        if t == 5 {
+            boosts.push((b, v == 1));
+        } else if matches!(t, 16..=19 | 40..=43) {
+            specials.entry(t).or_default().push((b, v));
+        }
+    }
+    boosts.extend(json["colorBoostBeatmapEvents"].as_array().into_iter().flatten().map(|e| (e["b"].as_f64().unwrap_or(0.0), e["o"].as_bool().unwrap_or(false))));
+    boosts.sort_by(|a, b| a.0.total_cmp(&b.0));
+    specials.values_mut().for_each(|v| v.sort_by(|a, b| a.0.total_cmp(&b.0)));
+    (specials, boosts)
+}
+
 /// Ring events (type 8 or 9) as (seconds, custom data), in time order.
 fn ring_events(json: &Value, ty: i64, bpm: f64) -> Vec<(f32, Value)> {
     let v3 = json["basicBeatmapEvents"].as_array();
@@ -276,6 +397,9 @@ impl Motion {
             Some(m.pivots.len() - 1)
         };
         m.rings = Self::build_rings(components, json, bpm);
+        m.groups = crate::groups::GroupLights::new(components, json);
+        m.bpm = bpm;
+        (m.specials, m.boosts) = read_specials(json);
         for (k, c) in components.iter().enumerate() {
             let x = &c["fields"];
             match c["type"].as_str().unwrap_or_default() {
@@ -297,6 +421,25 @@ impl Motion {
                         start,
                         override_random: y["OverrideRandomValues"].as_bool().unwrap_or(false),
                         seed: k as u64 * 7919,
+                        events: events(json, &types, bpm),
+                    });
+                }
+                "LightPairSinMoveEffect" => {
+                    let Some(vis) = find(&x["Visual"], "LightPairSinMove") else { continue };
+                    let y = &vis["fields"];
+                    let t = |i: usize| &y["Transforms"][i]["Transform"];
+                    let (Some(lp), Some(rp)) = (t(0)["path"].as_str(), t(1)["path"].as_str()) else { continue };
+                    let id = |v: &Value| mat(&v["pm"]).unwrap_or(std::array::from_fn(|i| if i % 5 == 0 { 1.0 } else { 0.0 }));
+                    let types = [x["LeftEventType"].as_i64().unwrap_or(12), x["RightEventType"].as_i64().unwrap_or(13), x["SwitchEventType"].as_i64().unwrap_or(-1)];
+                    m.sin_pairs.push(SinPair {
+                        paths: [lp.to_owned(), rp.to_owned()],
+                        parents: [id(t(0)), id(t(1))],
+                        start_offset: vec3(&y["StartPositionOffset"]),
+                        end_offset: vec3(&y["EndPositionOffset"]),
+                        value_offset: f(&y["StartValueOffset"], 0.0),
+                        override_random: y["OverrideRandomValues"].as_bool().unwrap_or(false),
+                        types,
+                        seed: k as u64 * 6151,
                         events: events(json, &types, bpm),
                     });
                 }
@@ -592,6 +735,20 @@ impl Motion {
         out
     }
 
+    /// A special event type's events, in time order.
+    pub fn special_events(&self, ty: i64) -> &[(f64, i64)] {
+        self.specials.get(&ty).map_or(&[], Vec::as_slice)
+    }
+
+    pub fn boosted(&self, beat: f64) -> bool {
+        let i = self.boosts.partition_point(|b| b.0 <= beat);
+        i > 0 && self.boosts[i - 1].1
+    }
+
+    pub fn beats_per_second(&self) -> f64 {
+        self.bpm / 60.0
+    }
+
     /// Ring id → how that ring moved from its exported pose at `seconds`.
     pub fn ring_deltas(&self, seconds: f32) -> Vec<(i64, M4)> {
         let position = f64::from(seconds) / f64::from(FIXED_DT);
@@ -626,7 +783,8 @@ impl Motion {
 
     pub fn deltas(&self, seconds: f32) -> Vec<(&str, M4)> {
         let angles = self.angles(seconds);
-        self.pivots
+        let mut out: Vec<(&str, M4)> = self
+            .pivots
             .iter()
             .zip(angles)
             .filter(|(p, a)| (a - p.rest).abs() > 1e-4)
@@ -635,7 +793,24 @@ impl Motion {
                 let local = mul(&invert(&euler(scaled(p.vector, p.rest))), &euler(scaled(p.vector, a)));
                 (p.path.as_str(), mul(&p.m0, &mul(&local, &p.inv0)))
             })
-            .collect()
+            .collect();
+        // Sine-moved pairs: exported at their start phase, moved by the offset difference.
+        for sp in &self.sin_pairs {
+            let phases = sp.phases(seconds);
+            for (i, side) in [1.0f32, -1.0].into_iter().enumerate() {
+                let (now, rest) = (sp.offset(phases[i], side), sp.offset(sp.value_offset, side));
+                let d: [f32; 3] = std::array::from_fn(|k| now[k] - rest[k]);
+                if d.iter().all(|v| v.abs() < 1e-6) {
+                    continue;
+                }
+                let pm = &sp.parents[i];
+                let w: [f32; 3] = std::array::from_fn(|r| pm[r * 4] * d[0] + pm[r * 4 + 1] * d[1] + pm[r * 4 + 2] * d[2]);
+                let mut t: M4 = std::array::from_fn(|i| if i % 5 == 0 { 1.0 } else { 0.0 });
+                (t[3], t[7], t[11]) = (w[0], w[1], w[2]);
+                out.push((sp.paths[i].as_str(), t));
+            }
+        }
+        out
     }
 }
 

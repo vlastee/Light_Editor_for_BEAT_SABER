@@ -68,6 +68,29 @@ enum Change {
     Value(i64, i64),
     /// An effect key's Chroma field: set, or removed.
     Custom(String, Option<Value>),
+    /// A number in a document key's JSON.
+    Document(Vec<Step>, Value),
+    /// Adds (copying the last entry) or removes the last entry of a list in a document key's JSON.
+    DocumentList(Vec<Step>, bool),
+}
+
+/// One step of a path into a document key's JSON.
+#[derive(Clone, Copy)]
+enum Step {
+    Field(&'static str),
+    Owned(usize),
+    Index(usize),
+}
+
+fn walk<'a>(mut v: &'a mut Value, names: &[String], path: &[Step]) -> &'a mut Value {
+    for s in path {
+        v = match s {
+            Step::Field(n) => &mut v[*n],
+            Step::Owned(i) => &mut v[names[*i].as_str()],
+            Step::Index(i) => &mut v[*i],
+        };
+    }
+    v
 }
 
 impl Change {
@@ -77,7 +100,8 @@ impl Change {
             Change::Beat(_) => true,
             Change::Easing(_) => !k.effect,
             Change::Axis(..) => k.pos.is_some(),
-            Change::Value(..) | Change::Custom(..) => k.effect,
+            Change::Value(..) | Change::Custom(..) => k.effect && !k.document,
+            Change::Document(..) | Change::DocumentList(..) => k.document,
             _ => !k.effect && k.pos.is_none(),
         };
         if !takes {
@@ -93,6 +117,24 @@ impl Change {
                 k.raw_value = Some(*v);
                 k.kind = Key::effect_shape(*lane, *v);
                 k.source = None;
+            }
+            Change::Document(path, v) => {
+                let names = document_names(k);
+                if let Some(doc) = &mut k.source {
+                    *walk(doc, &names, path) = v.clone();
+                }
+            }
+            Change::DocumentList(path, add) => {
+                let names = document_names(k);
+                if let Some(list) = k.source.as_mut().and_then(|d| walk(d, &names, path).as_array_mut()) {
+                    if *add {
+                        if let Some(last) = list.last().cloned() {
+                            list.push(last);
+                        }
+                    } else if list.len() > 1 {
+                        list.pop();
+                    }
+                }
             }
             Change::Custom(name, v) => {
                 match v {
@@ -223,6 +265,185 @@ fn effect_speed(k: &Key) -> f32 {
 
 fn effect_active(k: &Key) -> bool {
     k.raw_value.unwrap_or(0) != 0 || effect_speed(k) > 0.0
+}
+
+/// A new light group event at `beat`, for a row with no key to copy. VFX need a shared table entry.
+fn new_group_event(lane: i64, beat: f64) -> Option<Value> {
+    let (kind, group) = map::group_of(lane)?;
+    let filter = json!({ "f": 1, "p": 1, "t": 0, "r": 0, "c": 0, "n": 0, "s": 0, "l": 0, "d": 0 });
+    let event = match kind {
+        0 => json!({ "f": filter, "w": 0, "d": 1, "r": 0, "t": 1, "b": 0, "i": 0, "e": [{ "b": 0, "i": 0, "c": 1, "s": 1, "f": 0 }] }),
+        1 => json!({ "f": filter, "w": 0, "d": 1, "s": 0, "t": 1, "b": 0, "i": 0, "a": 0, "r": 0, "l": [{ "b": 0, "p": 0, "e": 0, "l": 0, "r": 0, "o": 0 }] }),
+        2 => json!({ "f": filter, "w": 0, "d": 1, "s": 0, "t": 1, "b": 0, "i": 0, "a": 0, "r": 0, "l": [{ "b": 0, "p": 0, "e": 0, "t": 0 }] }),
+        _ => return None,
+    };
+    Some(json!({ "b": beat, "g": group, "e": [event] }))
+}
+
+const FILTER_FIELDS: [(&str, &str); 9] = [
+    ("f", "Type (1 sections, 2 steps)"),
+    ("p", "Sections / start"),
+    ("t", "Section / step"),
+    ("r", "Reverse"),
+    ("c", "Chunks"),
+    ("n", "Random"),
+    ("s", "Seed"),
+    ("l", "Limit"),
+    ("d", "Limit affects"),
+];
+
+/// A numeric field of a document key.
+fn number_row(ui: &mut egui::Ui, label: &str, v: &Value, path: Vec<Step>, inputs: &mut Vec<egui::Id>, changes: &mut Vec<Change>) {
+    ui.label(label);
+    let Some(mut n) = v.as_f64() else {
+        ui.label("-");
+        ui.end_row();
+        return;
+    };
+    let whole = n.fract() == 0.0;
+    let r = ui.add(egui::DragValue::new(&mut n).speed(if whole { 0.1 } else { 0.01 }));
+    inputs.push(r.id);
+    if r.changed() {
+        changes.push(Change::Document(path, json!(n)));
+    }
+    ui.end_row();
+}
+
+fn fields_grid(ui: &mut egui::Ui, id: (u64, &'static str, usize, usize), value: &Value, fields: &[(&'static str, &str)], base: &[Step], inputs: &mut Vec<egui::Id>, changes: &mut Vec<Change>) {
+    egui::Grid::new(id).num_columns(2).spacing([10.0, 3.0]).show(ui, |ui| {
+        for (key, label) in fields {
+            let mut path = base.to_vec();
+            path.push(Step::Field(key));
+            number_row(ui, label, &value[*key], path, inputs, changes);
+        }
+    });
+}
+
+/// The Keyframe panel for a light group key: its boxes, filters and events.
+fn group_fields(ui: &mut egui::Ui, kind: usize, t: &Key, inputs: &mut Vec<egui::Id>, changes: &mut Vec<Change>) {
+    let Some(doc) = &t.source else { return };
+    let boxes = doc["e"].as_array().map_or(&[][..], Vec::as_slice);
+    let (box_fields, event_key, event_fields): (&[(&'static str, &str)], &'static str, &[(&'static str, &str)]) = match kind {
+        0 => (
+            &[("w", "Beat spread"), ("d", "Beat spread type"), ("r", "Brightness spread"), ("t", "Brightness spread type"), ("b", "Affect first"), ("i", "Spread easing")],
+            "e",
+            &[("b", "Beat"), ("i", "Transition"), ("c", "Color"), ("s", "Brightness"), ("f", "Strobe")],
+        ),
+        1 => (
+            &[("w", "Beat spread"), ("d", "Beat spread type"), ("s", "Rotation spread"), ("t", "Rotation spread type"), ("b", "Affect first"), ("i", "Spread easing"), ("a", "Axis"), ("r", "Flip")],
+            "l",
+            &[("b", "Beat"), ("p", "Use previous"), ("e", "Easing"), ("l", "Loops"), ("r", "Rotation"), ("o", "Direction")],
+        ),
+        2 => (
+            &[("w", "Beat spread"), ("d", "Beat spread type"), ("s", "Move spread"), ("t", "Move spread type"), ("b", "Affect first"), ("i", "Spread easing"), ("a", "Axis"), ("r", "Flip")],
+            "l",
+            &[("b", "Beat"), ("p", "Use previous"), ("e", "Easing"), ("t", "Move")],
+        ),
+        _ => (
+            &[("w", "Beat spread"), ("d", "Beat spread type"), ("s", "Value spread"), ("t", "Value spread type"), ("b", "Affect first"), ("i", "Spread easing")],
+            "l",
+            &[("b", "Beat"), ("p", "Use previous"), ("e", "Easing"), ("v", "Value")],
+        ),
+    };
+    for (bi, b) in boxes.iter().enumerate() {
+        egui::CollapsingHeader::new(format!("Box {}", bi + 1)).id_salt(("box", t.id, bi)).default_open(boxes.len() == 1).show(ui, |ui| {
+            let base = vec![Step::Field("e"), Step::Index(bi)];
+            egui::CollapsingHeader::new("Which lights").id_salt(("filter", t.id, bi)).show(ui, |ui| {
+                let mut path = base.clone();
+                path.push(Step::Field("f"));
+                fields_grid(ui, (t.id, "filter", bi, 0), &b["f"], &FILTER_FIELDS, &path, inputs, changes);
+            });
+            fields_grid(ui, (t.id, "box", bi, 0), b, box_fields, &base, inputs, changes);
+            let events = b[event_key].as_array().map_or(&[][..], Vec::as_slice);
+            for (ei, e) in events.iter().enumerate().filter(|(_, e)| e.is_object()) {
+                egui::CollapsingHeader::new(format!("Event {}", ei + 1)).id_salt(("event", t.id, bi, ei)).default_open(events.len() == 1).show(ui, |ui| {
+                    let mut path = base.clone();
+                    path.extend([Step::Field(event_key), Step::Index(ei)]);
+                    fields_grid(ui, (t.id, "event", bi, ei), e, event_fields, &path, inputs, changes);
+                });
+            }
+            if events.iter().all(Value::is_object) {
+                ui.horizontal(|ui| {
+                    let mut path = base.clone();
+                    path.push(Step::Field(event_key));
+                    if ui.small_button("+ event").clicked() {
+                        changes.push(Change::DocumentList(path.clone(), true));
+                    }
+                    if ui.small_button("− event").clicked() {
+                        changes.push(Change::DocumentList(path, false));
+                    }
+                });
+            }
+        });
+    }
+    ui.horizontal(|ui| {
+        if ui.small_button("+ box").clicked() {
+            changes.push(Change::DocumentList(vec![Step::Field("e")], true));
+        }
+        if ui.small_button("− box").clicked() {
+            changes.push(Change::DocumentList(vec![Step::Field("e")], false));
+        }
+    });
+}
+
+/// The animated properties of a component key's JSON, as (component, property) names. For v2 fog,
+/// the properties sit directly in the event data and the component is empty.
+fn document_names(k: &Key) -> Vec<String> {
+    let Some(doc) = &k.source else { return Vec::new() };
+    let data = if doc.get("d").is_some() { &doc["d"] } else { &doc["_data"] };
+    let mut names = Vec::new();
+    for (name, v) in data.as_object().into_iter().flatten() {
+        names.push(name.clone());
+        for inner in v.as_object().into_iter().flat_map(|o| o.keys()) {
+            names.push(inner.clone());
+        }
+    }
+    names
+}
+
+/// One animated property: a constant `[v]`, or points `[[v, t, "ease"], …]`.
+fn property_rows(ui: &mut egui::Ui, label: &str, value: &Value, base: &[Step], inputs: &mut Vec<egui::Id>, changes: &mut Vec<Change>) {
+    let Some(list) = value.as_array() else { return };
+    if list.first().is_some_and(Value::is_number) {
+        let mut path = base.to_vec();
+        path.push(Step::Index(0));
+        number_row(ui, label, &list[0], path, inputs, changes);
+        return;
+    }
+    for (i, p) in list.iter().enumerate() {
+        let mut path = base.to_vec();
+        path.extend([Step::Index(i), Step::Index(0)]);
+        number_row(ui, &format!("{label} {}", i + 1), &p[0], path, inputs, changes);
+        let mut at = base.to_vec();
+        at.extend([Step::Index(i), Step::Index(1)]);
+        number_row(ui, "   at", &p[1], at, inputs, changes);
+    }
+}
+
+/// The Keyframe panel for a Chroma fog or component key.
+fn component_fields(ui: &mut egui::Ui, t: &Key, inputs: &mut Vec<egui::Id>, changes: &mut Vec<Change>) {
+    let Some(doc) = &t.source else { return };
+    let (root, duration): (&'static str, &'static str) = if doc.get("d").is_some() { ("d", "duration") } else { ("_data", "_duration") };
+    let data = &doc[root];
+    let names = document_names(t);
+    let index = |name: &String| names.iter().position(|n| n == name).unwrap_or(0);
+    ui.label(format!("Track: {}", data["track"].as_str().or(data["_track"].as_str()).unwrap_or("-")));
+    egui::Grid::new(("component", t.id)).num_columns(2).spacing([10.0, 3.0]).show(ui, |ui| {
+        number_row(ui, "Duration", &data[duration], vec![Step::Field(root), Step::Field(duration)], inputs, changes);
+        for (name, v) in data.as_object().into_iter().flatten() {
+            if name == "track" || name == "_track" || name == "duration" || name == "_duration" {
+                continue;
+            }
+            if let Some(component) = v.as_object() {
+                for (property, value) in component {
+                    let base = [Step::Field(root), Step::Owned(index(name)), Step::Owned(index(property))];
+                    property_rows(ui, property, value, &base, inputs, changes);
+                }
+            } else {
+                property_rows(ui, name.trim_start_matches('_'), v, &[Step::Field(root), Step::Owned(index(name))], inputs, changes);
+            }
+        }
+    });
 }
 
 /// A Chroma number on an effect key: the box adds or removes it.
@@ -539,10 +760,10 @@ impl App {
         let env_name = d.environment.clone();
         match map::load_beatmap(&m.folder.join(&d.file), &mut self.next_id) {
             Ok(bm) => {
-                self.collapsed = map::LIGHT_LANES
-                    .iter()
+                self.collapsed = std::iter::once(&(map::GROUP_HEADER, ""))
+                    .chain(map::LIGHT_LANES)
                     .map(|(t, _)| *t)
-                    .filter(|t| bm.rows.iter().filter(|r| r.lane == *t).count() > 6)
+                    .filter(|t| bm.rows.iter().filter(|r| r.in_lane(*t)).count() > 6)
                     .collect();
                 self.palette = compute_palette(&bm.rows);
                 self.preview_lights = preview::build(&bm.rows);
@@ -611,6 +832,7 @@ impl App {
                     .map(|r| el.spinning(r, &self.motion, at(&r.keys[0]), at(&r.keys[r.keys.len() - 1])))
                     .sum::<usize>()
             });
+            let fog = bm.rows.iter().any(|r| r.lane == map::FOG_LANE && !r.keys.is_empty());
             match bm.save() {
                 Ok(msg) => {
                     // Warnings first: the backup path can run off the status bar.
@@ -620,6 +842,8 @@ impl App {
                     }
                     if moves && !self.map.as_ref().is_some_and(lists_chroma) {
                         warn += " Add Chroma to the map's requirements or the lights won't move in the game.";
+                    } else if fog && !self.map.as_ref().is_some_and(lists_chroma) {
+                        warn += " Add Chroma to the map's requirements or the fog won't change in the game.";
                     }
                     self.status = if warn.is_empty() { msg } else { format!("{}  ·  {msg}", warn.trim_start()) };
                     self.dirty = false;
@@ -761,6 +985,18 @@ impl App {
         self.push_undo();
         self.next_id += 1;
         let id = self.next_id;
+        // The first fog key in a map holds the fog as it is there, so adding it changes nothing yet.
+        let fog_event = self.beatmap.as_ref().filter(|bm| bm.rows[row_idx].lane == map::FOG_LANE).map(|bm| {
+            let base = self.env.as_ref().and_then(|e| e.fog).unwrap_or(crate::environment::FogParams {
+                offset: 0.0,
+                height: 25.0,
+                start_y: -50.0,
+                attenuation: 0.002,
+                auto_exposure_limit: 1000.0,
+                legacy_auto_exposure: false,
+            });
+            bm.new_fog_event(beat, self.motion.groups.fog(bm, beat, base))
+        });
         let Some(bm) = &mut self.beatmap else { return };
         let v3 = bm.names.version == "v3";
         let row = &mut bm.rows[row_idx];
@@ -768,6 +1004,15 @@ impl App {
             // Starts where the lights are at that moment, so adding a key doesn't move them.
             let easing = row.keys.iter().rev().find(|k| k.beat <= beat).and_then(|k| k.easing.clone());
             Key::line(row.kind, id, beat, row.position_at(beat), easing)
+        } else if row.is_document() {
+            let previous = row.keys.iter().rev().find(|k| k.beat <= beat).or(row.keys.first());
+            let lane = row.lane;
+            let event = previous.and_then(|k| k.source.clone()).or_else(|| new_group_event(lane, beat)).or(fog_event);
+            let Some(event) = event else {
+                self.status = "This row needs an existing key to copy.".into();
+                return;
+            };
+            Key::document(id, beat, row.lane, event)
         } else if row.is_effect() {
             let lane = row.lane;
             // Like the key before it; a first key turns the effect on.
@@ -809,6 +1054,7 @@ impl App {
                 pos: None,
                 effect: false,
                 source: None,
+                document: false,
             },
         } };
         row.keys.push(key);
@@ -823,7 +1069,8 @@ impl App {
     fn line_target(&self, kind: RowKind) -> Option<usize> {
         let rows = &self.beatmap.as_ref()?.rows;
         let i = self.active_row?;
-        if !rows.get(i)?.is_light() {
+        // Chroma doesn't read v4 files.
+        if !rows.get(i)?.is_light() || self.beatmap.as_ref()?.v4.is_some() {
             return None;
         }
         (!rows[i + 1..].iter().take_while(|r| r.is_motion()).any(|r| r.kind == kind)).then_some(i)
@@ -949,7 +1196,7 @@ impl App {
         let Some(bm) = &self.beatmap else {
             return (out, 0.0);
         };
-        for lane in map::LANE_ORDER {
+        for lane in map::LANE_ORDER.iter() {
             if map::is_effect_lane(*lane) {
                 // One line each, no lane header.
                 for (i, _) in bm.rows.iter().enumerate().filter(|(_, r)| r.lane == *lane) {
@@ -975,6 +1222,20 @@ impl App {
                 }
             }
         }
+        for (i, _) in bm.rows.iter().enumerate().filter(|(_, r)| r.kind == RowKind::Component) {
+            out.push(Laid { line: Line::Row(i), y, h: ROW_H });
+            y += ROW_H;
+        }
+        if bm.rows.iter().any(Row::is_group) {
+            out.push(Laid { line: Line::Lane(map::GROUP_HEADER), y, h: LANE_H });
+            y += LANE_H;
+            if !self.collapsed.contains(&map::GROUP_HEADER) {
+                for (i, _) in bm.rows.iter().enumerate().filter(|(_, r)| r.is_group()) {
+                    out.push(Laid { line: Line::Row(i), y, h: ROW_H });
+                    y += ROW_H;
+                }
+            }
+        }
         (out, y + self.scroll_y - top)
     }
 
@@ -984,7 +1245,7 @@ impl App {
         };
         match line {
             Line::Row(i) => bm.rows.get(i).into_iter().collect(),
-            Line::Lane(lane) => bm.rows.iter().filter(|r| r.lane == lane).collect(),
+            Line::Lane(lane) => bm.rows.iter().filter(|r| r.in_lane(lane)).collect(),
         }
     }
 
@@ -1448,7 +1709,7 @@ impl App {
                 Line::Lane(lane) => {
                     // Summary row: one small marker per pixel column that has keys.
                     let mut marks: Vec<(i32, bool)> = Vec::new();
-                    for row in bm.rows.iter().filter(|r| r.lane == lane) {
+                    for row in bm.rows.iter().filter(|r| r.in_lane(lane)) {
                         for k in key_range(row, self.view_start - pad, view_end + pad) {
                             marks.push((
                                 self.beat_to_x(k.beat).round() as i32,
@@ -1490,7 +1751,7 @@ impl App {
             let cy = l.y + l.h / 2.0;
             match l.line {
                 Line::Lane(lane) => {
-                    let n = bm.rows.iter().filter(|r| r.lane == lane && r.is_light()).count();
+                    let n = bm.rows.iter().filter(|r| r.in_lane(lane) && (r.is_light() || r.is_group())).count();
                     let sign = if self.collapsed.contains(&lane) { "+" } else { "−" };
                     lp.text(
                         Pos2::new(full.left() + 8.0, cy),
@@ -1502,6 +1763,16 @@ impl App {
                 }
                 Line::Row(i) => {
                     let row = &bm.rows[i];
+                    if row.is_document() {
+                        lp.text(
+                            Pos2::new(full.left() + if row.is_group() { 30.0 } else { 8.0 }, cy),
+                            Align2::LEFT_CENTER,
+                            format!("{}  [{}]", row.label(), row.keys.len()),
+                            font.clone(),
+                            if row.is_group() { Color32::from_rgb(195, 170, 255) } else { Color32::from_rgb(160, 225, 170) },
+                        );
+                        continue;
+                    }
                     if row.is_effect() {
                         lp.text(
                             Pos2::new(full.left() + 8.0, cy),
@@ -1802,7 +2073,9 @@ impl App {
                     bm.rows.iter().find(|r| r.keys.iter().any(|k| k.id == t.id)).map(|r| r.lane)
                 });
                 let v3 = self.beatmap.as_ref().is_some_and(|bm| bm.names.version == "v3");
-                effect_fields(ui, lane.unwrap_or(0), &t, v3, &mut self.text_inputs, &mut changes);
+                if !t.document {
+                    effect_fields(ui, lane.unwrap_or(0), &t, v3, &mut self.text_inputs, &mut changes);
+                }
                 return;
             }
 
@@ -1919,6 +2192,14 @@ impl App {
             });
             ui.end_row();
         });
+
+        if t.document {
+            let lane = self.beatmap.as_ref().and_then(|bm| bm.rows.iter().find(|r| r.keys.iter().any(|k| k.id == t.id)).map(|r| r.lane));
+            egui::ScrollArea::vertical().max_height(ui.available_height() - 40.0).show(ui, |ui| match lane.and_then(map::group_of) {
+                Some((kind, _)) => group_fields(ui, kind, &t, &mut self.text_inputs, &mut changes),
+                None => component_fields(ui, &t, &mut self.text_inputs, &mut changes),
+            });
+        }
 
         if !self.palette.is_empty() && t.pos.is_none() && !t.effect {
             ui.add_space(10.0);
@@ -2074,7 +2355,14 @@ impl App {
         if let (true, Some(e), Some(el), Some(gpu), Some(rs)) = (self.use_gpu, env, &self.env_lights, &mut self.gpu, &self.wgpu) {
             let ppp = ui.ctx().pixels_per_point();
             let (w, h) = (((rect.width() * ppp) as u32).max(1), ((rect.height() * ppp) as u32).max(1));
-            let mut state = el.state_at(e, &|k| model.map_or([0.0; 4], |m| m.color_keys(k.0, &k.1, beat)), &self.motion, seconds);
+            let groups = &self.motion.groups;
+            let color = |k: &(i64, Vec<i64>)| {
+                model.map_or([0.0; 4], |m| match map::group_of(k.0) {
+                    Some((_, group)) => groups.color(group, k.1.first().copied().unwrap_or(0), beat, &|c| m.group_color(c, beat)),
+                    None => m.color_keys(k.0, &k.1, beat),
+                })
+            };
+            let mut state = el.state_at(e, &color, &self.motion, seconds);
             if let Some(bm) = &self.beatmap {
                 el.apply_positions(e, &mut state, &bm.rows, beat);
             }
@@ -2090,6 +2378,7 @@ impl App {
                 auto_exposure_limit: 1000.0,
                 legacy_auto_exposure: false,
             });
+            let fog = self.beatmap.as_ref().map_or(fog, |bm| self.motion.groups.fog(bm, beat, fog));
             let view = crate::gpu3d::View::from_camera(&self.camera, e.unit);
             gpu.set_environment(e, None);
             let out = gpu.render(&crate::gpu3d::Frame { view, width: w, height: h, env: e, state: &state, fog, post_bloom: true });

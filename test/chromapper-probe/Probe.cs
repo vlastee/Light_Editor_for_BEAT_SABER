@@ -197,9 +197,22 @@ public class ProbeRunner : MonoBehaviour
             case AnimationCurve ac:
                 return "[" + string.Join(",", ac.keys.Select(k => $"[{F(k.time)},{F(k.value)},{F(k.inTangent)},{F(k.outTangent)}]")) + "]";
             case Material mat: return mat == null ? "null" : "{\"material\":\"" + Esc(mat.name) + "\",\"shader\":\"" + Esc(mat.shader != null ? mat.shader.name : "") + "\"}";
-            case Transform t: return t == null ? "null" : "{\"path\":\"" + Esc(PathOf(t)) + "\",\"m\":" + M(t.localToWorldMatrix) + "}";
+            case Transform t: return t == null ? "null" : "{\"path\":\"" + Esc(PathOf(t)) + "\",\"id\":" + t.GetInstanceID() + ",\"m\":" + M(t.localToWorldMatrix) + ",\"pm\":" + M(t.parent != null ? t.parent.localToWorldMatrix : Matrix4x4.identity) + "}";
+            case Rigidbody rb: return rb == null ? "null" : "{\"component\":\"Rigidbody\",\"id\":" + rb.GetInstanceID() + ",\"path\":\"" + Esc(PathOf(rb.transform))
+                + "\",\"mass\":" + F(rb.mass) + ",\"drag\":" + F(rb.linearDamping) + ",\"angularDrag\":" + F(rb.angularDamping)
+                + ",\"gravity\":" + (rb.useGravity ? "true" : "false") + ",\"kinematic\":" + (rb.isKinematic ? "true" : "false")
+                + ",\"com\":" + Dump(rb.worldCenterOfMass, 0) + ",\"inertia\":" + Dump(rb.inertiaTensor, 0)
+                + ",\"inertiaRotation\":" + Dump(rb.inertiaTensorRotation, 0) + ",\"m\":" + M(rb.transform.localToWorldMatrix)
+                + ",\"constraints\":\"" + rb.constraints + "\"}";
+            case SpringJoint sj: return sj == null ? "null" : "{\"component\":\"SpringJoint\",\"id\":" + sj.GetInstanceID() + ",\"path\":\"" + Esc(PathOf(sj.transform))
+                + "\",\"spring\":" + F(sj.spring) + ",\"damper\":" + F(sj.damper) + ",\"minDistance\":" + F(sj.minDistance)
+                + ",\"maxDistance\":" + F(sj.maxDistance) + ",\"anchor\":" + Dump(sj.anchor, 0) + ",\"connectedAnchor\":" + Dump(sj.connectedAnchor, 0)
+                + ",\"autoConfigure\":" + (sj.autoConfigureConnectedAnchor ? "true" : "false")
+                + ",\"connectedBody\":" + (sj.connectedBody != null ? "\"" + Esc(PathOf(sj.connectedBody.transform)) + "\"" : "null")
+                + ",\"m\":" + M(sj.transform.localToWorldMatrix) + "}";
             case Component comp: return comp == null ? "null" : "{\"component\":\"" + comp.GetType().Name + "\",\"id\":" + comp.GetInstanceID() + ",\"path\":\"" + Esc(PathOf(comp.transform)) + "\"}";
             case Texture tex: return tex == null ? "null" : "\"" + TexKey(tex) + "\"";
+            case GameObject go: return go == null ? "null" : "{\"gameObject\":\"" + Esc(PathOf(go.transform)) + "\"}";
             case Object uo: return uo == null ? "null" : "\"" + Esc(uo.name) + "\"";
             case System.Delegate: return "null";
             case IList list:
@@ -227,6 +240,14 @@ public class ProbeRunner : MonoBehaviour
         return "{" + string.Join(",", parts) + "}";
     }
 
+    // Instance IDs of a transform and its ancestors (to tell apart objects that share a path).
+    private static string Tids(Transform t)
+    {
+        var ids = new List<int>();
+        for (; t != null; t = t.parent) ids.Add(t.GetInstanceID());
+        return "[" + string.Join(",", ids) + "]";
+    }
+
     private static string PathOf(Transform t)
     {
         var path = t.name;
@@ -235,7 +256,7 @@ public class ProbeRunner : MonoBehaviour
     }
 
     private static readonly System.Text.RegularExpressions.Regex componentTypes = new(
-        "Light|Bloom|Glow|Reflection|Spectrogram|Mirror|Ring|Rotation|Gradient|Lightmap|Fog|Sprite|Material|Parametric|Probe",
+        "Light|ColorArray|Fx$|Bloom|Glow|Reflection|Spectrogram|Mirror|Ring|Rotation|Gradient|Lightmap|Fog|Sprite|Material|Parametric|Probe|Effect|Movement|Switch|Callback|Hydraulic|Particle|Fire",
         System.Text.RegularExpressions.RegexOptions.Compiled);
 
     private readonly List<BloomFogObject> bloomFogExported = new();
@@ -257,7 +278,50 @@ public class ProbeRunner : MonoBehaviour
                   .Append("\",\"active\":").Append(mb.isActiveAndEnabled ? "true" : "false")
                   .Append(",\"light\":").Append(Driven(lc) ? $"[{lc.Type},{KeysJson(lc)}]" : "null")
                   .Append(",\"m\":").Append(M(mb.transform.localToWorldMatrix))
-                  .Append(",\"fields\":").Append(Fields(mb, 2)).Append('}');
+                  .Append(",\"fields\":").Append(Fields(mb, mb.GetType().Name.Contains("GroupEffect") || mb.GetType().Name.Contains("Switch") ? 4 : 2)).Append('}');
+            }
+        // Unity constraints (PositionConstraint and friends are Behaviours, not MonoBehaviours).
+        foreach (var root in d.gameObject.scene.GetRootGameObjects())
+            foreach (var comp in root.GetComponentsInChildren<Behaviour>(true))
+            {
+                if (comp is not UnityEngine.Animations.IConstraint ic) continue;
+                if (!first) sb.Append(",\n");
+                first = false;
+                var srcs = new List<UnityEngine.Animations.ConstraintSource>();
+                ic.GetSources(srcs);
+                var extra = new StringBuilder();
+                switch (comp)
+                {
+                    case UnityEngine.Animations.PositionConstraint pc:
+                        extra.Append(",\"atRest\":").Append(Dump(pc.translationAtRest, 0)).Append(",\"offset\":").Append(Dump(pc.translationOffset, 0))
+                             .Append(",\"axis\":\"").Append(pc.translationAxis).Append('"');
+                        break;
+                    case UnityEngine.Animations.RotationConstraint rc:
+                        extra.Append(",\"atRest\":").Append(Dump(rc.rotationAtRest, 0)).Append(",\"offset\":").Append(Dump(rc.rotationOffset, 0))
+                             .Append(",\"axis\":\"").Append(rc.rotationAxis).Append('"');
+                        break;
+                    case UnityEngine.Animations.ScaleConstraint sc:
+                        extra.Append(",\"atRest\":").Append(Dump(sc.scaleAtRest, 0)).Append(",\"offset\":").Append(Dump(sc.scaleOffset, 0))
+                             .Append(",\"axis\":\"").Append(sc.scalingAxis).Append('"');
+                        break;
+                    case UnityEngine.Animations.ParentConstraint pa:
+                        extra.Append(",\"translationAtRest\":").Append(Dump(pa.translationAtRest, 0)).Append(",\"rotationAtRest\":").Append(Dump(pa.rotationAtRest, 0))
+                             .Append(",\"translationOffsets\":[").Append(string.Join(",", pa.translationOffsets.Select(v => Dump(v, 0)))).Append(']')
+                             .Append(",\"rotationOffsets\":[").Append(string.Join(",", pa.rotationOffsets.Select(v => Dump(v, 0)))).Append(']')
+                             .Append(",\"translationAxis\":\"").Append(pa.translationAxis).Append("\",\"rotationAxis\":\"").Append(pa.rotationAxis).Append('"');
+                        break;
+                }
+                sb.Append("{\"type\":\"").Append(comp.GetType().Name).Append("\",\"id\":").Append(comp.GetInstanceID())
+                  .Append(",\"path\":\"").Append(Esc(PathOf(comp.transform))).Append("\",\"tid\":").Append(comp.transform.GetInstanceID())
+                  .Append(",\"tids\":").Append(Tids(comp.transform))
+                  .Append(",\"active\":").Append(comp.isActiveAndEnabled && ic.constraintActive ? "true" : "false")
+                  .Append(",\"m\":").Append(M(comp.transform.localToWorldMatrix))
+                  .Append(",\"pm\":").Append(M(comp.transform.parent != null ? comp.transform.parent.localToWorldMatrix : Matrix4x4.identity))
+                  .Append(",\"fields\":{\"weight\":").Append(F(ic.weight))
+                  .Append(",\"sources\":[").Append(string.Join(",", srcs.Where(x => x.sourceTransform != null).Select(x =>
+                      "{\"tid\":" + x.sourceTransform.GetInstanceID() + ",\"tids\":" + Tids(x.sourceTransform) + ",\"path\":\"" + Esc(PathOf(x.sourceTransform)) + "\",\"weight\":" + F(x.weight)
+                      + ",\"m\":" + M(x.sourceTransform.localToWorldMatrix) + "}"))).Append(']')
+                  .Append(extra).Append("}}");
             }
         sb.Append("]");
         File.WriteAllText(Path.Combine(outDir, "components.json"), sb.ToString());
@@ -276,6 +340,7 @@ public class ProbeRunner : MonoBehaviour
               .Append(",\"material\":").Append(b.LightType?.Material != null ? "\"" + Esc(b.LightType.Material.name) + "\"" : "null")
               .Append(",\"blendOp\":").Append(b.LightType?.Material != null && b.LightType.Material.HasProperty("_BlendOp") ? F(b.LightType.Material.GetFloat("_BlendOp")) : "null")
               .Append(",\"priority\":").Append(b.LightType?.RenderingPriority ?? 0)
+              .Append(",\"tids\":").Append(Tids(b.transform))
               .Append(",\"fields\":").Append(Fields(b, 1)).Append('}');
             if (b.LightType?.Material != null && b.LightType.Material.HasProperty("_MainTex") && b.LightType.Material.GetTexture("_MainTex") != null)
                 TexKey(b.LightType.Material.GetTexture("_MainTex"));
@@ -330,13 +395,13 @@ public class ProbeRunner : MonoBehaviour
     private static readonly string[] blockNames =
     {
         "_Color", "_AlphaWidth", "_SizeParams", "_EmissionTexColor", "_EmissionColor", "_PrivatePointLightColor",
-        "_ParallaxColor", "_TintColor", "_EmissionGradientIntensity", "_PeakOffset",
+        "_ParallaxColor", "_TintColor", "_EmissionGradientIntensity", "_PeakOffset", "_ColorsArrayOffset", "_StartTime", "_TimeOffset",
     };
 
     private void RecordFull(float beat)
     {
         var sb = new StringBuilder();
-        sb.Append("{\"beat\":").Append(F(beat));
+        sb.Append("{\"beat\":").Append(F(beat)).Append(",\"seconds\":").Append(F(context.Atsc.CurrentSeconds));
         sb.Append(",\"cameras\":[").Append(string.Join(",", Camera.allCameras.Where(c => c.isActiveAndEnabled).Select(c =>
             "{\"name\":\"" + Esc(c.name) + "\",\"depth\":" + F(c.depth) + ",\"target\":" + (c.targetTexture != null ? "true" : "false")
             + ",\"fov\":" + F(c.fieldOfView) + ",\"near\":" + F(c.nearClipPlane) + ",\"far\":" + F(c.farClipPlane)
@@ -382,6 +447,21 @@ public class ProbeRunner : MonoBehaviour
             blocks.Add("[" + i + "," + (r.enabled ? "1" : "0") + ",{" + string.Join(",", props) + "}]");
         }
         sb.Append(",\"blocks\":[").Append(string.Join(",", blocks)).Append(']');
+        // SpriteRenderer colors (sprite lights set them instead of a property block).
+        var sprites = new List<string>();
+        for (var i = 0; i < exportedRenderers.Count; i++)
+            if (exportedRenderers[i] is SpriteRenderer sr && sr != null)
+                sprites.Add("[" + i + "," + (sr.enabled ? "1" : "0") + "," + C(sr.color) + "]");
+        sb.Append(",\"sprites\":[").Append(string.Join(",", sprites)).Append(']');
+        // ColorArrayLightsController materials' _ColorsArray, by controller instance ID.
+        var arrays = new List<string>();
+        foreach (var c in FindObjectsByType<ColorArrayLightsController>(FindObjectsSortMode.None))
+        {
+            if (c.Material == null) continue;
+            var arr = c.Material.GetVectorArray(c.ColorsArrayPropertyName);
+            arrays.Add("[" + c.GetInstanceID() + ",[" + (arr == null ? "" : string.Join(",", arr.Select(V4))) + "]]");
+        }
+        sb.Append(",\"colorArrays\":[").Append(string.Join(",", arrays)).Append(']');
         sb.Append(",\"particles\":[").Append(string.Join(",", particleSystems.Select(ParticlesJson))).Append("]}\n");
         File.AppendAllText(Path.Combine(outDir, "snapshots.jsonl"), sb.ToString());
     }
@@ -427,6 +507,48 @@ public class ProbeRunner : MonoBehaviour
         exportedMatrices.Clear();
         var systems = new List<string>();
         particleSystems.Clear();
+        // Particle bursts spawned by events (ParticleSystemEmitEventEffect): ChroMapper simulates a copy of the
+        // prefab from each event; bake that simulation at 30 frames per second.
+        var clips = new List<string>();
+        foreach (var fx in FindObjectsByType<ParticleSystemEmitEventEffect>(FindObjectsSortMode.None))
+        {
+            if (fx.Prefab == null || fx.ParticleSystemParentTransform == null) continue;
+            ParticleSystemEventController inst = null;
+            try
+            {
+                inst = Instantiate(fx.Prefab, fx.ParticleSystemParentTransform, false);
+                inst.gameObject.SetActive(true);
+                var systemsOf = inst.GetComponentsInChildren<ParticleSystem>(true);
+                var parts = new List<string>();
+                foreach (var ps in systemsOf)
+                {
+                    var psr = ps.GetComponent<ParticleSystemRenderer>();
+                    if (psr == null) continue;
+                    var pmats = new List<int>();
+                    foreach (var mat in psr.sharedMaterials)
+                    {
+                        if (mat == null) { pmats.Add(-1); continue; }
+                        if (!matIndex.TryGetValue(mat, out var k)) { k = matIndex[mat] = mats.Count; mats.Add(MaterialJson(mat)); }
+                        pmats.Add(k);
+                    }
+                    var frames = new List<string>();
+                    const float dt = 1f / 30f;
+                    for (var t = 0f; t <= fx.Prefab.FullDuration + 1e-4f; t += dt)
+                    {
+                        ps.Simulate(t, true, true);
+                        frames.Add(ParticlesJson(ps));
+                    }
+                    var main = ps.main;
+                    parts.Add("{\"path\":\"" + Esc(PathOf(ps.transform)) + "\",\"materials\":[" + string.Join(",", pmats) + "]"
+                        + ",\"m\":" + M(ps.transform.localToWorldMatrix) + ",\"space\":\"" + main.simulationSpace + "\""
+                        + ",\"renderMode\":\"" + psr.renderMode + "\",\"dt\":" + F(dt) + ",\"frames\":[" + string.Join(",", frames) + "]}");
+                }
+                clips.Add("{\"effect\":" + fx.GetInstanceID() + ",\"path\":\"" + Esc(PathOf(fx.transform)) + "\",\"duration\":" + F(fx.Prefab.FullDuration)
+                    + ",\"max\":" + fx.MaxSpawnedParticleSystems + ",\"systems\":[" + string.Join(",", parts) + "]}");
+            }
+            catch (System.Exception e) { Debug.LogWarning($"BslProbe: particle clip {fx.name}: {e.Message}"); }
+            finally { if (inst != null) DestroyImmediate(inst.gameObject); }
+        }
         foreach (var root in d.gameObject.scene.GetRootGameObjects())
         {
             foreach (var r in root.GetComponentsInChildren<Renderer>(false))
@@ -512,8 +634,11 @@ public class ProbeRunner : MonoBehaviour
                     + ",\"enabled\":" + (r.enabled ? "true" : "false")
                     + ",\"layer\":" + r.gameObject.layer
                     + ",\"kind\":\"" + r.GetType().Name + "\""
+                    + (r is SpriteRenderer srr ? ",\"spriteColor\":" + C(srr.color)
+                        + (srr.sprite != null && srr.sprite.texture != null ? ",\"spriteTex\":\"" + TexKey(srr.sprite.texture) + "\"" : "") : "")
                     + ",\"sortingOrder\":" + r.sortingOrder
                     + ",\"name\":\"" + Esc(r.gameObject.name) + "\",\"path\":\"" + Esc(path) + "\""
+                    + ",\"tids\":" + Tids(r.transform)
                     + ",\"block\":" + BlockJson(r) + "}");
             }
         }
@@ -521,6 +646,7 @@ public class ProbeRunner : MonoBehaviour
         sb.Append(",\"materialList\":[").Append(string.Join(",", mats)).Append(']');
         sb.Append(",\"objects\":[").Append(string.Join(",", objs)).Append(']');
         sb.Append(",\"particleSystems\":[").Append(string.Join(",", systems)).Append(']');
+        sb.Append(",\"particleClips\":[").Append(string.Join(",", clips)).Append(']');
         sb.Append(",\"stats\":{\"renderers\":").Append(objs.Count).Append(",\"meshes\":").Append(meshes.Count)
           .Append(",\"unreadable\":").Append(unreadable).Append("}}");
         File.WriteAllText(Path.Combine(outDir, "environment.json"), sb.ToString());
@@ -713,7 +839,7 @@ public class ProbeRunner : MonoBehaviour
             default:
                 return null;
         }
-        return MeshText(name, verts, norms, uvs, cols, idx);
+        return MeshText(name, verts, norms, uvs, new List<Vector2>(), cols, idx);
     }
 
     private static string MeshJsonOf(Mesh mesh, out bool readable)
@@ -722,6 +848,7 @@ public class ProbeRunner : MonoBehaviour
         var verts = new List<Vector3>();
         var norms = new List<Vector3>();
         var uvs = new List<Vector2>();
+        var uvs2 = new List<Vector2>();
         var cols = new List<Color>();
         var idx = new List<int>();
         var name = mesh.name;
@@ -733,6 +860,7 @@ public class ProbeRunner : MonoBehaviour
                     mesh.GetVertices(verts);
                     mesh.GetNormals(norms);
                     mesh.GetUVs(0, uvs);
+                    mesh.GetUVs(1, uvs2);
                     mesh.GetColors(cols);
                     for (var s = 0; s < mesh.subMeshCount; s++)
                         AddFaces(idx, mesh.GetIndices(s), mesh.GetTopology(s));
@@ -740,14 +868,14 @@ public class ProbeRunner : MonoBehaviour
                 else
                 {
                     readable = false;
-                    if (!GpuRead(mesh, verts, norms, uvs, cols, idx)) return null;
+                    if (!GpuRead(mesh, verts, norms, uvs, uvs2, cols, idx)) return null;
                 }
                 break;
         }
-        return MeshText(name, verts, norms, uvs, cols, idx);
+        return MeshText(name, verts, norms, uvs, uvs2, cols, idx);
     }
 
-    private static string MeshText(string name, List<Vector3> verts, List<Vector3> norms, List<Vector2> uvs, List<Color> cols, List<int> idx)
+    private static string MeshText(string name, List<Vector3> verts, List<Vector3> norms, List<Vector2> uvs, List<Vector2> uvs2, List<Color> cols, List<int> idx)
     {
         var sb = new StringBuilder();
         sb.Append("{\"name\":\"").Append(Esc(name)).Append("\",\"v\":[");
@@ -756,6 +884,8 @@ public class ProbeRunner : MonoBehaviour
         if (norms.Count == verts.Count) sb.Append(string.Join(",", norms.SelectMany(v => new[] { v.x, v.y, v.z }).Select(F)));
         sb.Append("],\"uv\":[");
         if (uvs.Count == verts.Count) sb.Append(string.Join(",", uvs.SelectMany(v => new[] { v.x, v.y }).Select(F)));
+        sb.Append("],\"uv2\":[");
+        if (uvs2.Count == verts.Count) sb.Append(string.Join(",", uvs2.SelectMany(v => new[] { v.x, v.y }).Select(F)));
         sb.Append("],\"c\":[");
         if (cols.Count == verts.Count) sb.Append(string.Join(",", cols.SelectMany(c => new[] { c.r, c.g, c.b, c.a }).Select(F)));
         sb.Append("],\"i\":[").Append(string.Join(",", idx.Where(i => i >= 0 && i < verts.Count))).Append("]}");
@@ -793,7 +923,7 @@ public class ProbeRunner : MonoBehaviour
         _ => 1,
     };
 
-    private static bool GpuRead(Mesh mesh, List<Vector3> verts, List<Vector3> norms, List<Vector2> uvs, List<Color> cols, List<int> idx)
+    private static bool GpuRead(Mesh mesh, List<Vector3> verts, List<Vector3> norms, List<Vector2> uvs, List<Vector2> uvs2, List<Color> cols, List<int> idx)
     {
         var n = mesh.vertexCount;
         var streams = new Dictionary<int, byte[]>();
@@ -834,6 +964,8 @@ public class ProbeRunner : MonoBehaviour
             if (nor != null) norms.AddRange(nor.Select(v => new Vector3(v[0], v[1], v[2])));
             var uv = Attr(UnityEngine.Rendering.VertexAttribute.TexCoord0, 2);
             if (uv != null) uvs.AddRange(uv.Select(v => new Vector2(v[0], v[1])));
+            var uv2 = Attr(UnityEngine.Rendering.VertexAttribute.TexCoord1, 2);
+            if (uv2 != null) uvs2.AddRange(uv2.Select(v => new Vector2(v[0], v[1])));
             var col = Attr(UnityEngine.Rendering.VertexAttribute.Color, 4);
             if (col != null) cols.AddRange(col.Select(v => new Color(v[0], v[1], v[2], v[3])));
             using var ib = mesh.GetIndexBuffer();

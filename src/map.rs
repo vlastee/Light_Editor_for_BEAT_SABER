@@ -33,16 +33,39 @@ pub const EFFECT_LANES: &[(i64, &str)] = &[
     (41, "Special 41"),
     (42, "Special 42"),
     (43, "Special 43"),
+    (GROUP_HEADER, "Light Groups"),
+    (FOG_LANE, "Chroma Fog"),
+    (COMPONENT_LANE, "Chroma Components"),
 ];
 
 /// Effect lanes always offered; the Special ones only appear in maps that use them.
 const COMMON_EFFECTS: [i64; 5] = [5, 8, 9, 12, 13];
 
+/// The collapsible header above the v3 light group rows.
+pub const GROUP_HEADER: i64 = 9000;
+/// Rows of Chroma component animation: fog, and other components.
+pub const FOG_LANE: i64 = 9100;
+pub const COMPONENT_LANE: i64 = 9101;
+
+/// The v3 event lists of light groups, in the order of their `group_lane` kinds.
+pub const GROUP_LISTS: [&str; 4] = ["lightColorEventBoxGroups", "lightRotationEventBoxGroups", "lightTranslationEventBoxGroups", "vfxEventBoxGroups"];
+const GROUP_NAMES: [&str; 4] = ["Color", "Rotation", "Translation", "VFX"];
+
+/// The timeline lane of a light group (`kind` indexes `GROUP_LISTS`).
+pub fn group_lane(kind: usize, group: i64) -> i64 {
+    (kind as i64 + 1) * 100_000 + group
+}
+
+/// (kind, group id) of a `group_lane`.
+pub fn group_of(lane: i64) -> Option<(usize, i64)> {
+    (100_000..500_000).contains(&lane).then(|| ((lane / 100_000 - 1) as usize, lane % 100_000))
+}
+
 /// Top-to-bottom order of the lanes on the timeline.
 pub const LANE_ORDER: &[i64] = &[5, 0, 1, 8, 9, 2, 12, 3, 13, 4, 6, 7, 10, 11, 16, 17, 18, 19, 40, 41, 42, 43];
 
 pub fn is_effect_lane(et: i64) -> bool {
-    EFFECT_LANES.iter().any(|(t, _)| *t == et)
+    et < GROUP_HEADER && EFFECT_LANES.iter().any(|(t, _)| *t == et)
 }
 
 pub fn lane_name(et: i64) -> &'static str {
@@ -184,7 +207,10 @@ pub struct Key {
     /// On an effect row (boost, ring, laser speed…); `raw_value` holds its value.
     pub effect: bool,
     /// An effect event as it was in the file, written back unchanged until it's edited.
+    /// On a light group or component row, the event itself, edited in place.
     pub source: Option<Value>,
+    /// On a light group or component row.
+    pub document: bool,
 }
 
 /// Legacy Chroma stored RGB in the value itself: 2_000_000_000 + 0xRRGGBB.
@@ -215,6 +241,7 @@ impl Key {
             pos: Some(pos),
             effect: false,
             source: None,
+            document: false,
         }
     }
 
@@ -238,7 +265,19 @@ impl Key {
             pos: None,
             effect: true,
             source: None,
+            document: false,
         }
+    }
+
+    /// A keyframe on a light group or component row: `event` is its JSON.
+    pub fn document(id: u64, beat: f64, lane: i64, event: Value) -> Key {
+        let mut key = Key::effect(id, beat, lane, 0);
+        key.kind = Kind::On;
+        key.color = Some(if lane >= 100_000 { [0.72, 0.55, 1.0, 1.0] } else { [0.55, 0.85, 0.6, 1.0] });
+        key.raw_value = None;
+        key.source = Some(event);
+        key.document = true;
+        key
     }
 
     /// Off-shaped when the value switches the effect off; ring events are just triggers.
@@ -286,6 +325,10 @@ pub enum RowKind {
     Aim,
     /// Non-light events: boost, ring spin and zoom, laser speed, special events.
     Effect,
+    /// A v3 light group: each key is one event box group.
+    Group,
+    /// Chroma component animation: each key is one custom event.
+    Component,
 }
 
 impl Row {
@@ -301,11 +344,29 @@ impl Row {
         self.kind == RowKind::Effect
     }
 
+    pub fn is_group(&self) -> bool {
+        self.kind == RowKind::Group
+    }
+
+    /// Whether its keys are JSON events edited in place.
+    pub fn is_document(&self) -> bool {
+        matches!(self.kind, RowKind::Group | RowKind::Component)
+    }
+
+    /// Whether the row is listed under this lane on the timeline.
+    pub fn in_lane(&self, lane: i64) -> bool {
+        if lane == GROUP_HEADER { self.is_group() } else { self.lane == lane }
+    }
+
     pub fn label(&self) -> String {
         match self.kind {
             RowKind::Position => return "Position".to_owned(),
             RowKind::Aim => return "Aim".to_owned(),
-            RowKind::Effect => return lane_name(self.lane).to_owned(),
+            RowKind::Effect | RowKind::Component => return lane_name(self.lane).to_owned(),
+            RowKind::Group => {
+                let (kind, group) = group_of(self.lane).unwrap_or((0, 0));
+                return format!("{} · Group {group}", GROUP_NAMES[kind]);
+            }
             RowKind::Light => {}
         }
         match &self.light_ids {
@@ -432,7 +493,7 @@ pub struct Names {
     et: &'static str,
     i: &'static str,
     f: &'static str,
-    custom: &'static str,
+    pub custom: &'static str,
     light_id: &'static str,
     color: &'static str,
     easing: &'static str,
@@ -475,6 +536,8 @@ pub struct Beatmap {
     pub other_events: Vec<Value>,
     pub rows: Vec<Row>,
     pub backed_up: bool,
+    /// For a v4 lightshow: the file as it was (`json` holds it expanded to v3's shape).
+    pub v4: Option<Value>,
 }
 
 fn read_json(path: &Path) -> Result<Value, String> {
@@ -536,7 +599,8 @@ pub fn load_info(folder: &Path) -> Result<LoadedMap, String> {
                     d["characteristic"].as_str().unwrap_or("?"),
                     d["difficulty"].as_str().unwrap_or("?")
                 ),
-                file: d["beatmapDataFilename"].as_str().unwrap_or_default().to_owned(),
+                // v4 keeps the lights in their own file, which difficulties can share.
+                file: d["lightshowDataFilename"].as_str().filter(|f| !f.is_empty()).or(d["beatmapDataFilename"].as_str()).unwrap_or_default().to_owned(),
                 environment: d["environmentNameIdx"]
                     .as_u64()
                     .and_then(|i| info["environmentNames"].get(i as usize))
@@ -578,14 +642,16 @@ pub fn load_info(folder: &Path) -> Result<LoadedMap, String> {
 }
 
 pub fn load_beatmap(path: &Path, next_id: &mut u64) -> Result<Beatmap, String> {
-    let json = read_json(path)?;
+    let raw = read_json(path)?;
+    let v4 = crate::v4::is_lightshow(&raw).then(|| raw.clone());
+    let json = if v4.is_some() { crate::v4::expand(&raw) } else { raw };
     let n: &'static Names = if json.get("basicBeatmapEvents").is_some() {
         &V3
     } else if json.get("_events").is_some() {
         &V2
     } else {
         return Err(format!(
-            "{} is format version '{}'. Only v2 and v3 difficulty files are supported.",
+            "{} is format version '{}'. Only v2 and v3 difficulties and v4 lightshows are supported.",
             path.display(),
             json["version"].as_str().unwrap_or("?")
         ));
@@ -670,6 +736,7 @@ pub fn load_beatmap(path: &Path, next_id: &mut u64) -> Result<Beatmap, String> {
             pos: None,
             effect: false,
             source: None,
+            document: false,
         };
 
         match rows
@@ -693,6 +760,23 @@ pub fn load_beatmap(path: &Path, next_id: &mut u64) -> Result<Beatmap, String> {
         let mut key = Key::effect(*next_id, beat, 5, on);
         key.source = Some(ev.clone());
         add_effect(&mut rows, 5, key);
+    }
+    for (kind, name) in GROUP_LISTS.iter().enumerate() {
+        for group in json[*name].as_array().into_iter().flatten() {
+            let (Some(beat), Some(g)) = (group["b"].as_f64(), group["g"].as_i64()) else { continue };
+            *next_id += 1;
+            let lane = group_lane(kind, g);
+            let key = Key::document(*next_id, beat, lane, group.clone());
+            match rows.iter_mut().find(|r| r.lane == lane) {
+                Some(row) => row.keys.push(key),
+                None => rows.push(Row { lane, light_ids: None, keys: vec![key], kind: RowKind::Group }),
+            }
+        }
+    }
+    load_components(n, &json, &mut rows, next_id);
+    // A fog row to add fog to maps without any (Chroma doesn't read v4 files).
+    if v4.is_none() && !rows.iter().any(|r| r.lane == FOG_LANE) {
+        rows.push(Row { lane: FOG_LANE, light_ids: None, keys: Vec::new(), kind: RowKind::Component });
     }
     for lane in COMMON_EFFECTS {
         if !rows.iter().any(|r| r.lane == lane) {
@@ -726,10 +810,61 @@ pub fn load_beatmap(path: &Path, next_id: &mut u64) -> Result<Beatmap, String> {
         other_events,
         rows,
         backed_up: false,
+        v4,
     })
 }
 
 const BOOST_LIST: &str = "colorBoostBeatmapEvents";
+const FOG_NAMES: [&str; 4] = ["_attenuation", "_offset", "_startY", "_height"];
+/// The track the editor puts the fog on in maps that don't animate fog yet.
+pub const NEW_FOG_TRACK: &str = "bslt_fog";
+
+/// Custom events animating fog or other components, and the v2 tracks assigned to the fog.
+fn component_lane(n: &Names, ev: &Value, fog_tracks: &[String]) -> Option<i64> {
+    if n.version == "v3" {
+        if ev["t"] != "AnimateComponent" {
+            return None;
+        }
+        return Some(if ev["d"].get("BloomFogEnvironment").is_some() { FOG_LANE } else { COMPONENT_LANE });
+    }
+    let d = &ev["_data"];
+    let fog = ev["_type"] == "AnimateTrack"
+        && d["_track"].as_str().is_some_and(|t| fog_tracks.iter().any(|f| f == t))
+        && FOG_NAMES.iter().any(|k| d.get(*k).is_some());
+    fog.then_some(FOG_LANE)
+}
+
+fn custom_events_key(n: &Names) -> &'static str {
+    if n.version == "v3" { "customEvents" } else { "_customEvents" }
+}
+
+fn fog_tracks(n: &Names, json: &Value) -> Vec<String> {
+    let list = json[n.custom][custom_events_key(n)].as_array();
+    list.into_iter().flatten().filter(|e| e["_type"] == "AssignFogTrack").filter_map(|e| e["_data"]["_track"].as_str().map(str::to_owned)).collect()
+}
+
+fn load_components(n: &Names, json: &Value, rows: &mut Vec<Row>, next_id: &mut u64) {
+    let time = if n.version == "v3" { "b" } else { "_time" };
+    let tracks = fog_tracks(n, json);
+    for ev in json[n.custom][custom_events_key(n)].as_array().into_iter().flatten() {
+        let Some(lane) = component_lane(n, ev, &tracks) else { continue };
+        *next_id += 1;
+        let key = Key::document(*next_id, ev[time].as_f64().unwrap_or(0.0), lane, ev.clone());
+        match rows.iter_mut().find(|r| r.lane == lane) {
+            Some(row) => row.keys.push(key),
+            None => rows.push(Row { lane, light_ids: None, keys: vec![key], kind: RowKind::Component }),
+        }
+    }
+}
+
+/// A document key's JSON with its current beat.
+fn document_json(time: &str, key: &Key) -> Value {
+    let mut v = key.source.clone().unwrap_or(Value::Null);
+    if v[time].as_f64() != Some(key.beat) {
+        v[time] = json!(key.beat);
+    }
+    v
+}
 
 fn effect_key(n: &Names, id: u64, lane: i64, ev: &Value, obj: &Map<String, Value>) -> Key {
     let value = obj.get(n.i).and_then(Value::as_i64).unwrap_or(0);
@@ -940,13 +1075,122 @@ impl Beatmap {
                 self.json[BOOST_LIST] = Value::Array(b);
             }
         }
+        for (kind, name) in GROUP_LISTS.iter().enumerate() {
+            let mut list: Vec<(f64, Value)> = self
+                .rows
+                .iter()
+                .filter(|r| r.is_group() && group_of(r.lane).is_some_and(|(k, _)| k == kind))
+                .flat_map(|r| &r.keys)
+                .map(|k| (k.beat, document_json("b", k)))
+                .collect();
+            list.sort_by(|a, b| a.0.total_cmp(&b.0));
+            if !list.is_empty() || self.json.get(*name).is_some() {
+                self.json[*name] = Value::Array(list.into_iter().map(|e| e.1).collect());
+            }
+        }
+        self.sync_components();
+    }
+
+    /// The track the map's fog is animated on, if it has one: v2's AssignFogTrack, or v3's track on
+    /// the environment root (or on a BloomFogEnvironment component).
+    pub fn fog_track(&self) -> Option<String> {
+        let n = self.names;
+        if n.version != "v3" {
+            return fog_tracks(n, &self.json).into_iter().next();
+        }
+        let env = self.json[n.custom]["environment"].as_array()?;
+        env.iter().find_map(|e| {
+            let fog = e["components"]["BloomFogEnvironment"]["track"].as_str();
+            let root = e["id"].as_str().is_some_and(|id| id.trim_end_matches('$').ends_with("Environment") && !id.contains(".["));
+            fog.or_else(|| root.then(|| e["track"].as_str()).flatten()).map(str::to_owned)
+        })
+    }
+
+    /// A new fog animation at `beat` holding `fog` (the fog in effect there), on the map's fog track
+    /// or on a new one that saving assigns to the environment.
+    pub fn new_fog_event(&self, beat: f64, fog: crate::environment::FogParams) -> Value {
+        let track = self.fog_track().unwrap_or_else(|| NEW_FOG_TRACK.to_owned());
+        // Start and end points, so a duration and a second value make a fade.
+        let p = |v: f32| {
+            let v = (v as f64 * 1e6).round() / 1e6;
+            json!([[v, 0], [v, 1]])
+        };
+        if self.names.version == "v3" {
+            json!({ "b": beat, "t": "AnimateComponent", "d": { "track": track, "duration": 1,
+                "BloomFogEnvironment": { "attenuation": p(fog.attenuation), "offset": p(fog.offset), "startY": p(fog.start_y), "height": p(fog.height) } } })
+        } else {
+            json!({ "_time": beat, "_type": "AnimateTrack", "_data": { "_track": track, "_duration": 1,
+                "_attenuation": p(fog.attenuation), "_offset": p(fog.offset), "_startY": p(fog.start_y), "_height": p(fog.height) } })
+        }
+    }
+
+    /// Assigns the editor's new fog track to the fog when fog keys use it (once per map).
+    fn assign_new_fog_track(&mut self) {
+        let n = self.names;
+        let v3 = n.version == "v3";
+        let uses = self.rows.iter().filter(|r| r.lane == FOG_LANE).flat_map(|r| &r.keys).any(|k| {
+            let d = k.source.as_ref().map(|s| if v3 { &s["d"]["track"] } else { &s["_data"]["_track"] });
+            d.and_then(Value::as_str) == Some(NEW_FOG_TRACK)
+        });
+        if !uses || self.fog_track().is_some() {
+            return;
+        }
+        if !self.json[n.custom].is_object() {
+            self.json[n.custom] = json!({});
+        }
+        if v3 {
+            let env = &mut self.json[n.custom]["environment"];
+            if !env.is_array() {
+                *env = json!([]);
+            }
+            if let Some(list) = env.as_array_mut() {
+                list.push(json!({ "id": "[0]Environment", "lookupMethod": "Exact", "track": NEW_FOG_TRACK }));
+            }
+        } else {
+            let list = &mut self.json[n.custom]["_customEvents"];
+            if !list.is_array() {
+                *list = json!([]);
+            }
+            if let Some(list) = list.as_array_mut() {
+                list.insert(0, json!({ "_time": 0, "_type": "AssignFogTrack", "_data": { "_track": NEW_FOG_TRACK } }));
+            }
+        }
+    }
+
+    /// Writes component rows back into the custom events, leaving everything else as it was.
+    fn sync_components(&mut self) {
+        self.assign_new_fog_track();
+        let n = self.names;
+        let list_key = custom_events_key(n);
+        let time = if n.version == "v3" { "b" } else { "_time" };
+        let tracks = fog_tracks(n, &self.json);
+        let ours: Vec<Value> = self.rows.iter().filter(|r| r.kind == RowKind::Component).flat_map(|r| &r.keys).map(|k| document_json(time, k)).collect();
+        if self.json[n.custom][list_key].as_array().is_none() {
+            if ours.is_empty() {
+                return;
+            }
+            if !self.json[n.custom].is_object() {
+                self.json[n.custom] = json!({});
+            }
+            self.json[n.custom][list_key] = json!([]);
+        }
+        let Some(existing) = self.json[n.custom][list_key].as_array() else { return };
+        let theirs: Vec<&Value> = existing.iter().filter(|e| component_lane(n, e, &tracks).is_some()).collect();
+        // Untouched: the list stays exactly as it was.
+        if ours.len() == theirs.len() && ours.iter().all(|o| theirs.iter().any(|t| *t == o)) {
+            return;
+        }
+        let mut merged: Vec<Value> = existing.iter().filter(|e| component_lane(n, e, &tracks).is_none()).cloned().collect();
+        merged.extend(ours);
+        merged.sort_by(|a, b| a[time].as_f64().unwrap_or(0.0).total_cmp(&b[time].as_f64().unwrap_or(0.0)));
+        self.json[n.custom][list_key] = Value::Array(merged);
     }
 
     /// The full basic event list as it would be saved.
     pub fn build_events(&self) -> Vec<Value> {
         let n = self.names;
         let mut events = self.other_events.clone();
-        for row in self.rows.iter().filter(|r| !r.is_motion()) {
+        for row in self.rows.iter().filter(|r| r.is_light() || r.is_effect()) {
             let in_list = row.keys.iter().filter(|k| !in_boost_list(n, row, k));
             events.extend(in_list.map(|k| key_to_event(n, row, k)));
         }
@@ -1099,7 +1343,8 @@ impl Beatmap {
             msg = format!(" (original backed up to {})", PathBuf::from(backup).display());
         }
 
-        let text = serde_json::to_string(&self.json).map_err(|e| e.to_string())?;
+        let packed = self.v4.as_ref().map(|original| crate::v4::collapse(&self.json, original));
+        let text = serde_json::to_string(packed.as_ref().unwrap_or(&self.json)).map_err(|e| e.to_string())?;
         std::fs::write(&self.path, text).map_err(|e| format!("Write failed: {e}"))?;
         Ok(format!(
             "Saved {} light events to {}{msg}",
@@ -1165,7 +1410,7 @@ mod tests {
         let key = Key::line(RowKind::Position, 1, 4.0, [0.0, 2.0, 0.0], Some("easeInQuad".to_owned()));
         let end = Key::line(RowKind::Position, 2, 8.0, [1.0, 2.0, 0.0], None);
         let rows = vec![Row { lane: 2, light_ids: Some(json!([7, 8])), keys: vec![key, end], kind: RowKind::Position }];
-        Beatmap { path: PathBuf::new(), names, json, other_events: Vec::new(), rows, backed_up: false }
+        Beatmap { path: PathBuf::new(), names, json, other_events: Vec::new(), rows, backed_up: false, v4: None }
     }
 
     fn resolve(_: &Row) -> (Vec<MoveTarget>, usize) {
@@ -1190,6 +1435,37 @@ mod tests {
         bm.write_positions(Some(&resolve));
         assert_eq!(bm.json["customData"]["environment"].as_array().unwrap().len(), 2);
         assert_eq!(bm.json["customData"]["customEvents"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn fog_can_be_added_to_maps_without_fog() {
+        let fog = crate::environment::FogParams { offset: 1.0, height: 25.0, start_y: -50.0, attenuation: 0.002, auto_exposure_limit: 1000.0, legacy_auto_exposure: false };
+        for names in [&V3, &V2] {
+            let mut bm = map(names, json!({}));
+            bm.rows.clear();
+            let ev = bm.new_fog_event(2.0, fog);
+            bm.rows.push(Row { lane: FOG_LANE, light_ids: None, keys: vec![Key::document(9, 2.0, FOG_LANE, ev)], kind: RowKind::Component });
+            bm.sync_components();
+            let v3 = names.version == "v3";
+            let cd = &bm.json[names.custom];
+            assert_eq!(bm.fog_track().as_deref(), Some(NEW_FOG_TRACK), "{cd}");
+            let events = cd[custom_events_key(names)].as_array().unwrap();
+            if v3 {
+                assert_eq!(cd["environment"][0]["id"], "[0]Environment");
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0]["d"]["BloomFogEnvironment"]["attenuation"][1][0].as_f64(), Some(0.002));
+            } else {
+                assert_eq!(events[0]["_type"], "AssignFogTrack");
+                assert_eq!(events[1]["_data"]["_offset"][0][0].as_f64(), Some(1.0));
+            }
+            // Saving again changes nothing, and the key loads back onto the fog row.
+            let once = bm.json.clone();
+            bm.sync_components();
+            assert_eq!(bm.json, once);
+            let mut rows = Vec::new();
+            load_components(names, &bm.json, &mut rows, &mut 0);
+            assert_eq!(rows.iter().filter(|r| r.lane == FOG_LANE).map(|r| r.keys.len()).sum::<usize>(), 1);
+        }
     }
 
     #[test]
@@ -1260,7 +1536,7 @@ mod tests {
         key.source = Some(json!({ "b": 2.0, "o": true }));
         let new = Key::effect(2, 8.0, 5, 0);
         let rows = vec![Row { lane: 5, light_ids: None, keys: vec![key, new], kind: RowKind::Effect }];
-        let mut bm = Beatmap { path: PathBuf::new(), names: &V3, json: json!({}), other_events: Vec::new(), rows, backed_up: false };
+        let mut bm = Beatmap { path: PathBuf::new(), names: &V3, json: json!({}), other_events: Vec::new(), rows, backed_up: false, v4: None };
         assert_eq!(bm.build_boosts().unwrap(), [json!({ "b": 2.0, "o": true }), json!({ "b": 8.0, "o": false })]);
         assert!(bm.build_events().is_empty());
         bm.sync_events();
@@ -1270,7 +1546,7 @@ mod tests {
     #[test]
     fn v2_boosts_stay_basic_events() {
         let rows = vec![Row { lane: 5, light_ids: None, keys: vec![Key::effect(1, 2.0, 5, 1)], kind: RowKind::Effect }];
-        let bm = Beatmap { path: PathBuf::new(), names: &V2, json: json!({}), other_events: Vec::new(), rows, backed_up: false };
+        let bm = Beatmap { path: PathBuf::new(), names: &V2, json: json!({}), other_events: Vec::new(), rows, backed_up: false, v4: None };
         assert!(bm.build_boosts().is_none());
         assert_eq!(bm.build_events()[0]["_type"], 5);
     }

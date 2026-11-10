@@ -8,7 +8,7 @@ colors, checking the result in the 3D preview and saving.
 - A [Rust toolchain](https://rustup.rs) (1.95 or newer).
 - A graphics driver with Vulkan support. On OpenGL-only setups the app crashes when it loads an
   exported environment.
-- A map folder, the one containing `Info.dat`. v2 and v3 difficulty files both work.
+- A map folder, the one containing `Info.dat`. v2 and v3 difficulties and v4 lightshows all work.
 - Optional, for the realistic preview: ChroMapper with the ChroMapper-PropPreview plugin, plus
   podman and dotnet. Run this once to export every environment from your ChroMapper:
 
@@ -41,6 +41,7 @@ Pick the difficulty from the dropdown next to **Load**.
 5. **Playhead**: the moment shown in the preview.
 6. **Keyframe panel**: edits the selected keys. With nothing selected it lists the controls.
 7. **Preview**: the stage at the playhead, as seen from the player's position.
+8. **Yellow rows**: events that aren't light colors, such as laser speed, ring spin and color boost.
 
 Key shapes show the event type: ◆ On, ● Transition, ▲ Flash, ▼ Fade, ■ Off.
 
@@ -180,9 +181,51 @@ Select a key to change it in the **Keyframe** panel:
 A band on the Color Boost and Laser Speed rows shows when the boost is on or the lasers are spinning.
 Boost, laser speed, ring spin and ring zoom changes show up in the preview straight away. Without
 Chroma settings the game picks each ring spin's direction and step at random, so the rings can end up
-at different angles from the preview. **Special** events aren't previewed.
+at different angles from the preview.
 
-## 11. Rearrange
+**Special** events are previewed where they raise and lower objects (the Lady Gaga towers), switch
+objects on and off (such as Linkin Park's logo) or slide lasers (Interscope). Lizzo's balloon bursts,
+Pyro's fire and Interscope's hydraulic cars aren't previewed: ChroMapper doesn't show them either.
+
+## 11. Light groups
+
+Newer environments are lit by **light groups**. They appear under **Light Groups** at the bottom of
+the timeline, one row per group: `Color · Group 12`, `Rotation · Group 3`, `Translation · Group 5` and
+`VFX · Group 0`. Each key is one group event.
+
+![Light group rows with one key selected, and its boxes in the Keyframe panel](images/groups.png)
+
+Select a key to edit it in the **Keyframe** panel:
+
+- A key holds one or more **boxes**. Use **+ box** and **− box** to add or remove them.
+- **Which lights** picks the lights a box drives. **Beat spread** and the other spread settings stagger
+  its events and values across those lights.
+- Each box holds **events** in order, with their own beat, brightness or angle. Use **+ event** and
+  **− event** to change how many there are.
+
+Double-clicking a row adds a key that copies the one before it. All four kinds show in the preview:
+VFX groups drive what each environment wires them to, such as sliding parts, switching objects or the
+width of laser glows. **Highlight in preview** outlines a color group's lights. Filters set to random
+pick the same lights as in the game, from the filter's seed.
+
+## 12. Chroma fog
+
+The **Chroma Fog** row holds the map's fog animations, and **Chroma Components** shows animations of other
+components. Select a key to change its duration and values; the preview follows fog changes. Other
+component animations are editable but aren't previewed.
+
+To add fog to a map without any, double-click the **Chroma Fog** row. The new key holds the fog as it is,
+from its start value (`1`) to its end value (`2`) over its duration in beats, so set those in the
+**Keyframe** panel to fade the fog. Saving puts the fog on a track of its own
+(`bslt_fog`). Fog needs Chroma: the editor warns you on save if the map doesn't list it.
+
+## 13. v4 maps
+
+Maps in the v4 format keep their lights in a separate lightshow file, and they open like any other
+map. Several difficulties can share one lightshow, so an edit can change all of them. Position and Aim
+lines aren't available, because Chroma doesn't read v4 files.
+
+## 14. Rearrange
 
 | Action | How |
 |---|---|
@@ -193,7 +236,7 @@ at different angles from the preview. **Special** events aren't previewed.
 | Delete | `Delete` or `X` |
 | Undo, redo | `Ctrl+Z`, `Ctrl+Shift+Z` |
 
-## 12. Save
+## 15. Save
 
 Press `Ctrl+S`. The **Save** button shows `Save*` while there are unsaved changes, and **Revert**
 goes back to the last saved state.

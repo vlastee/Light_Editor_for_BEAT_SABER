@@ -6,11 +6,13 @@ mod environment;
 mod envscene;
 mod eval;
 mod gpu3d;
+mod groups;
 mod map;
 mod motion;
 mod preview;
 mod refrender;
 mod scene;
+mod v4;
 mod view3d;
 
 use eframe::egui;
@@ -49,6 +51,9 @@ fn main() -> eframe::Result {
     }
     if args.first().map(String::as_str) == Some("--plan-compare") && args.len() >= 3 {
         std::process::exit(check::plan_compare(std::path::Path::new(&args[1]), std::path::Path::new(&args[2])));
+    }
+    if args.first().map(String::as_str) == Some("--compare-motion") && args.len() >= 4 {
+        std::process::exit(check::compare_motion(std::path::Path::new(&args[1]), &args[2], std::path::Path::new(&args[3])));
     }
     if args.first().map(String::as_str) == Some("--compare-lights") && args.len() >= 4 {
         std::process::exit(check::compare_lights(

@@ -120,6 +120,15 @@ fn render_all(dir: &Path, pose: Option<&str>) -> Result<usize, String> {
         }
         let g = &s["globals"];
         let mut state = SceneState { sky: sky.clone(), mirror_plane: env_lights.mirror_plane(), ..Default::default() };
+        state.time = s["seconds"].as_f64().unwrap_or(0.0) as f32;
+        state.base_boost = [g["_BaseColorBoost"].as_f64().unwrap_or(1.0) as f32, g["_BaseColorBoostThreshold"].as_f64().unwrap_or(0.0) as f32];
+        // Color arrays by ColorArrayLightsController instance ID → that controller's material.
+        for a in s["colorArrays"].as_array().into_iter().flatten() {
+            let (Some(id), Some(colors)) = (a[0].as_i64(), a[1].as_array()) else { continue };
+            if let Some(mi) = env_lights.color_array_material(id) {
+                state.color_arrays.insert(mi, colors.iter().map(v4).collect());
+            }
+        }
         let arr = |k: &str| -> [[f32; 4]; 5] { std::array::from_fn(|i| v4(&g[k][i])) };
         state.lights = DirLights {
             pos: arr("_DirectionalLightPositions"),
@@ -149,7 +158,12 @@ fn render_all(dir: &Path, pose: Option<&str>) -> Result<usize, String> {
         }
         for b in s["blocks"].as_array().into_iter().flatten() {
             let (Some(i), Some(props)) = (b[0].as_u64(), b[2].as_object()) else { continue };
+            // Renderers switched off at export (lights at zero) can be on in the snapshot.
+            if b[1].as_i64() == Some(1) {
+                state.shown.insert(i as usize);
+            }
             let get = |k: &str| props.get(k).filter(|v| v.is_array()).map(v4);
+            let num = |k: &str| props.get(k).and_then(Value::as_f64).map(|v| v as f32);
             state.blocks.insert(
                 i as usize,
                 Block {
@@ -157,9 +171,20 @@ fn render_all(dir: &Path, pose: Option<&str>) -> Result<usize, String> {
                     alpha_width: get("_AlphaWidth"),
                     size_params: get("_SizeParams"),
                     emission_tex_color: get("_EmissionTexColor"),
+                    emission_color: get("_EmissionColor"),
+                    start_time: num("_StartTime"),
+                    time_offset: num("_TimeOffset"),
+                    colors_offset: num("_ColorsArrayOffset"),
+                    renderer_color: None,
                     enabled: b[1].as_i64() != Some(0),
                 },
             );
+        }
+        for sp in s["sprites"].as_array().into_iter().flatten() {
+            let Some(i) = sp[0].as_u64() else { continue };
+            let b = state.blocks.entry(i as usize).or_default();
+            b.renderer_color = Some(v4(&sp[2]));
+            b.enabled = b.enabled && sp[1].as_i64() != Some(0);
         }
         for (si, ps) in s["particles"].as_array().into_iter().flatten().enumerate() {
             let list = ps.as_array().into_iter().flatten().filter_map(crate::environment::Particle::from_json).collect();
@@ -205,10 +230,17 @@ fn render_all(dir: &Path, pose: Option<&str>) -> Result<usize, String> {
             }
             for (i, b) in computed.blocks {
                 let e = state.blocks.entry(i).or_default();
-                e.color = b.color;
+                e.color = b.color.or(e.color);
                 e.alpha_width = b.alpha_width.or(e.alpha_width);
                 e.size_params = b.size_params.or(e.size_params);
+                e.emission_color = b.emission_color.or(e.emission_color);
+                e.emission_tex_color = b.emission_tex_color.or(e.emission_tex_color);
+                e.colors_offset = b.colors_offset.or(e.colors_offset);
+                e.renderer_color = b.renderer_color.or(e.renderer_color);
+                e.enabled = b.enabled;
             }
+            state.shown.extend(computed.shown);
+            state.color_arrays.extend(computed.color_arrays);
             if std::env::var_os("BSLT_DEBUG").is_some() {
                 eprintln!("beat {beat}\n  recorded {:?}\n  computed {:?}", state.lights.color, computed.lights.color);
                 eprintln!("  rec pos {:?}\n  our pos {:?}", state.lights.pos, computed.lights.pos);

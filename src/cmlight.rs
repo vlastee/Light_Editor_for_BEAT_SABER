@@ -518,6 +518,16 @@ impl LightModel {
         i > 0 && self.boost[i - 1].1
     }
 
+    /// A v3 light group's environment color (0 red, 1 blue, 2 white) at `beat`.
+    pub fn group_color(&self, color: i64, beat: f64) -> [f32; 4] {
+        let base = match color {
+            0 => Base::Red,
+            1 => Base::Blue,
+            _ => Base::White,
+        };
+        self.scheme(base, false, self.boosted(beat))
+    }
+
     fn scheme(&self, c: Base, invert: bool, boost: bool) -> [f32; 4] {
         let p = &self.palette;
         let (red, blue, white) = if boost {

@@ -18,6 +18,12 @@ pub struct EnvObject {
     pub materials: Vec<i64>,
     pub matrix: [f32; 16],
     pub enabled: bool,
+    /// Instance IDs of the object's transform and its ancestors (tells apart same-named objects).
+    pub tids: Vec<i64>,
+    /// A SpriteRenderer's sprite texture (its `_MainTex`), by texture key.
+    pub sprite_tex: Option<String>,
+    /// A SpriteRenderer's color at export (linear rgb, as sprite lights set it).
+    pub sprite_color: Option<[f32; 4]>,
     /// Unity layer (decides what mirrors reflect), when exported.
     pub layer: Option<u32>,
     pub path: String,
@@ -29,6 +35,8 @@ pub struct EnvMesh {
     pub pos: Vec<[f32; 3]>,
     pub normal: Vec<[f32; 3]>,
     pub uv: Vec<[f32; 2]>,
+    /// The second UV set (color array indices), when exported.
+    pub uv2: Vec<[f32; 2]>,
     pub color: Vec<[f32; 4]>,
     pub idx: Vec<u32>,
 }
@@ -220,6 +228,7 @@ impl EnvFile {
                 let p = floats(&m["v"]);
                 let n = floats(&m["n"]);
                 let uv = floats(&m["uv"]);
+                let uv2 = floats(&m["uv2"]);
                 let c = floats(&m["c"]);
                 EnvMesh {
                     color: c.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect(),
@@ -227,6 +236,7 @@ impl EnvFile {
                     pos: p.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect(),
                     normal: n.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect(),
                     uv: uv.chunks_exact(2).map(|c| [c[0], c[1]]).collect(),
+                    uv2: uv2.chunks_exact(2).map(|c| [c[0], c[1]]).collect(),
                     idx: m["i"].as_array().into_iter().flatten().filter_map(|i| i.as_u64().map(|i| i as u32)).collect(),
                 }
             })
@@ -328,6 +338,9 @@ impl EnvFile {
                         matrix,
                         enabled,
                         layer: o["layer"].as_u64().map(|l| l as u32),
+                        tids: o["tids"].as_array().into_iter().flatten().filter_map(Value::as_i64).collect(),
+                        sprite_tex: o["spriteTex"].as_str().map(str::to_owned),
+                        sprite_color: o["spriteColor"].as_array().map(|a| std::array::from_fn(|i| a.get(i).and_then(Value::as_f64).unwrap_or(1.0) as f32)),
                         path: o["path"].as_str().unwrap_or_default().to_owned(),
                     }
                 })

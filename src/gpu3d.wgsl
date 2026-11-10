@@ -17,18 +17,22 @@ struct Globals {
     light_radius: array<vec4<f32>, 2>,
     clip: vec4<f32>,           // mirror plane (normal, offset) for the reflected view
     flags: vec4<f32>,          // x: clip on, y: mirrored winding
+    misc: vec4<f32>,           // song seconds, _BaseColorBoost, _BaseColorBoostThreshold
 };
 
 struct Object {
     model: mat4x4<f32>,
     normal: mat4x4<f32>,
     info: vec4<u32>,           // kind, flags
-    b: array<vec4<f32>, 4>,    // per renderer: _Color (linear rgb), _AlphaWidth, _SizeParams, _EmissionTexColor
+    // Per renderer: _Color (linear rgb), _AlphaWidth, _SizeParams, _EmissionTexColor, _EmissionColor,
+    // (_StartTime, color array index base + _ColorsArrayOffset, _TimeOffset, 0), SpriteRenderer color.
+    b: array<vec4<f32>, 7>,
     p: array<vec4<f32>, 12>,   // material parameters (layout per kind, see gpu3d.rs)
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
 @group(0) @binding(1) var<storage, read> objects: array<Object>;
+@group(0) @binding(2) var<storage, read> color_arr: array<vec4<f32>>;
 
 const KIND_LIT: u32 = 0u;
 const KIND_BOX_OPAQUE: u32 = 1u;
@@ -36,6 +40,7 @@ const KIND_BOX_TRANSPARENT: u32 = 2u;
 const KIND_FAKE_GLOW: u32 = 3u;
 const KIND_MIRROR: u32 = 4u;
 const KIND_SPECTROGRAM: u32 = 5u;
+const KIND_SLICE: u32 = 7u;
 
 const F_DIFFUSE: u32 = 1u;
 const F_SPECULAR: u32 = 2u;
@@ -54,6 +59,26 @@ const F_FOG_COLOR: u32 = 8192u;
 const F_FOG_ALPHA: u32 = 16384u;
 const F_FOG_LERP: u32 = 32768u;
 const F_WHITEBOOST_MAIN: u32 = 65536u;
+const F_USE_FOG_FOR_LIGHTS: u32 = 131072u;
+const F_ANGLE_DISAPPEAR: u32 = 262144u;
+const F_Y_BILLBOARD: u32 = 524288u;
+const F_ALPHA_WIDTH_SCALE: u32 = 1048576u;
+const F_WHITEBOOST_ALWAYS: u32 = 2097152u;
+const F_VERTEX_EMISSION: u32 = 4194304u;
+const F_EMISSION_FLIPBOOK: u32 = 8388608u;
+const F_COLOR_ARRAY: u32 = 16777216u;
+const F_TEXTURE_FLIPBOOK: u32 = 33554432u;
+const F_FLIPBOOK_NOBLEND: u32 = 67108864u;
+const F_SPECTROGRAM_COLOR: u32 = 134217728u;
+
+// _ColorsArray[round(uv2.x * 10 + uv2.y + _ColorsArrayOffset)] (b[5].y adds this material's base).
+fn array_color(o: Object, uv2: vec2<f32>) -> vec4<f32> {
+    let i = i32(round(uv2.x * 10.0 + uv2.y + o.b[5].y));
+    if (i < 0 || u32(i) >= arrayLength(&color_arr)) {
+        return vec4<f32>(0.0);
+    }
+    return color_arr[u32(i)];
+}
 
 fn has(o: Object, f: u32) -> bool {
     return (o.info.y & f) != 0u;
@@ -118,15 +143,18 @@ struct VOut {
     @location(2) uv: vec4<f32>,
     @location(3) color: vec4<f32>,
     @location(4) @interpolate(flat) id: u32,
+    @location(5) uv2: vec2<f32>,
 };
 
 @vertex
 fn vs_mesh(@location(0) pos_in: vec3<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32>,
-           @location(3) color: vec4<f32>, @builtin(instance_index) id: u32) -> VOut {
+           @location(3) color: vec4<f32>, @location(4) uv2: vec2<f32>, @builtin(instance_index) id: u32) -> VOut {
     let o = objects[id];
     let kind = o.info.x;
     var pos = pos_in;
     var extra = vec2<f32>(0.0, 0.0);
+    var uv_out = uv;
+    var color_out = color;
     if (kind == KIND_SPECTROGRAM) {
         // No audio: every band is 0, so the bars sink by their full peak offset.
         pos = pos - uv.y * o.p[4].xyz;
@@ -141,6 +169,44 @@ fn vs_mesh(@location(0) pos_in: vec3<f32>, @location(1) normal: vec3<f32>, @loca
         let s = sign(pos);
         let size = max(abs(sp.xyz), vec3<f32>(1e-5));
         pos = s + (pos - s) * (2.0 * sp.w / size);
+    } else if (kind == KIND_SLICE) {
+        // ParametricSliceBillboard: caps and body scaled apart, turned about Y to face the camera.
+        let c = o.b[0];
+        let aw = o.b[1];
+        let sp = o.b[2];
+        let ew = max((aw.wz - aw.zw) * 1.3333 + aw.zw, aw.wz * 0.01);
+        var band = ew.y;
+        if (uv.y > 0.9) {
+            band = ew.x;
+        } else if (uv.y > 0.5) {
+            band = aw.w;
+        } else if (uv.y > 0.1) {
+            band = aw.z;
+        }
+        var local_x = pos_in.x * sp.x * band;
+        if (has(o, F_ALPHA_WIDTH_SCALE)) {
+            let wa = sat(max(aw.x, aw.y) * c.a);
+            local_x = local_x * smooth01(sat((wa - 0.02) / max(wa, 1e-6)));
+        }
+        let cap = select(0.0, 1.0, abs(uv.y - 0.5) >= 0.49);
+        let local_y = (pos_in.y - sp.z) * sp.y + cap * (pos_in.y - 0.5) * sp.w;
+        let cap_dir = select(0.0, 1.0, uv.y < 0.5) - select(0.0, 1.0, uv.y > 0.5);
+        let adj_v = uv.y + (1.0 - cap) * (o.p[1].x - 0.25) * cap_dir;
+        let inv3 = transpose(mat3x3<f32>(o.normal[0].xyz, o.normal[1].xyz, o.normal[2].xyz));
+        let cam = inv3 * (g.cam_pos.xyz - o.model[3].xyz);
+        var lp = vec3<f32>(local_x, local_y, pos_in.z);
+        if (has(o, F_Y_BILLBOARD)) {
+            let cxz = normalize(cam.xz + vec2<f32>(1e-9, 0.0));
+            let sel = vec2<f32>(local_x, pos_in.z);
+            lp = vec3<f32>(dot(vec2<f32>(-cxz.y, -cxz.x), sel), local_y, dot(vec2<f32>(cxz.x, -cxz.y), sel));
+        }
+        pos = lp;
+        uv_out = vec2<f32>(uv.x * band, adj_v);
+        extra = vec2<f32>(band, select(aw.x, aw.y, local_y > (0.5 - sp.z)));
+        let ch = cam.y - local_y;
+        let dist = max(sqrt(dot(cam.xz, cam.xz) + ch * ch), 1e-6);
+        let ang = sat((dot(cam.xz / dist, normalize(cam.xz + vec2<f32>(1e-9, 0.0))) - 0.05) * 2.2222223);
+        color_out = vec4<f32>(smooth01(ang), 0.0, 0.0, 0.0);
     }
     let world = (o.model * vec4<f32>(pos, 1.0)).xyz;
     let n = normalize((o.normal * vec4<f32>(normal, 0.0)).xyz + vec3<f32>(0.0, 0.0, 1e-9));
@@ -151,9 +217,10 @@ fn vs_mesh(@location(0) pos_in: vec3<f32>, @location(1) normal: vec3<f32>, @loca
     out.clip = g.view_proj * vec4<f32>(world, 1.0);
     out.world = world;
     out.normal = n;
-    out.uv = vec4<f32>(uv, extra);
-    out.color = color;
+    out.uv = vec4<f32>(uv_out, extra);
+    out.color = color_out;
     out.id = id;
+    out.uv2 = uv2;
     return out;
 }
 
@@ -227,10 +294,53 @@ fn shade_lit(v: VOut, o: Object, front: bool) -> vec4<f32> {
     if (has(o, F_EMISSION_SIMPLE)) {
         let st = o.p[5];
         let e = textureSampleLevel(tex0, repeat_samp, v.uv.xy * st.xy + st.zw, 0.0).rg * o.p[4].w;
-        let c = o.b[3];
+        var c = o.b[3];
+        if (has(o, F_COLOR_ARRAY)) {
+            c = array_color(o, v.uv2);
+        }
         color = color + vec4<f32>(e.x * c.rgb * c.a, e.y * e.y * c.a * 3.5 * o.p[6].x);
-        supp = e.x * c.a * o.p[6].y;
+        supp = e.x * c.a;
     }
+    if (has(o, F_EMISSION_FLIPBOOK)) {
+        // Frames packed four to a texel (RGBA), _FlipbookColumns x _FlipbookRows, from _StartTime.
+        let fb = o.p[8];
+        let total = trunc(fb.x * fb.y);
+        let looping = trunc(total - fb.z);
+        let ft = (g.misc.x + o.b[5].z - o.b[5].x) * fb.w;
+        let lt = ft - fb.z;
+        let signed_count = select(-looping, looping, looping * lt >= -(looping * lt));
+        let frame = select(fract(lt / signed_count) * signed_count + fb.z, ft, ft < total);
+        let cq = floor(frame) / fb.x;
+        let column = fract(abs(cq)) * select(-1.0, 1.0, cq >= -cq) * fb.x;
+        let row = fb.y - 1.0 - floor(frame / fb.x);
+        let fuv = (vec2<f32>(column, row) + v.uv.xy) / vec2<f32>(fb.x, fb.y);
+        let ff = fract(frame);
+        var sel = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        if (ff < 0.25) {
+            sel = vec4<f32>(1.0, 0.0, 0.0, 0.0);
+        } else if (ff < 0.5) {
+            sel = vec4<f32>(0.0, 1.0, 0.0, 0.0);
+        } else if (ff < 0.75) {
+            sel = vec4<f32>(0.0, 0.0, 1.0, 0.0);
+        }
+        if (v.uv.x + v.uv.y <= 0.01) {
+            sel = vec4<f32>(0.0);
+        }
+        let st = o.p[5];
+        let e = dot(textureSampleLevel(tex0, repeat_samp, fuv * st.xy + st.zw, 0.0), sel) * o.p[4].w;
+        let c = o.b[3];
+        supp = supp + e * c.a;
+        color = vec4<f32>(color.rgb + e * c.rgb * c.a, e * e * c.a * 3.5 * o.p[6].x);
+    }
+    if (has(o, F_VERTEX_EMISSION)) {
+        // ResolveVertexEmission: vertex green past _EmissionThreshold, times _EmissionColor.
+        let ec = o.b[4];
+        let t = sat((v.color.g - o.p[7].x) / max(1.0 - o.p[7].x, 1e-5));
+        let k = smooth01(t) * o.p[7].y;
+        supp = supp + k * ec.a * ec.a;
+        color = color + vec4<f32>(ec.rgb * ec.a * k, v.color.a * v.color.a * ec.a * o.p[7].z);
+    }
+    supp = supp * o.p[6].y;
     if (!has(o, F_ACES_BEFORE)) {
         color = vec4<f32>(aces(color.rgb), color.a);
     }
@@ -338,15 +448,81 @@ fn shade_mirror(v: VOut, o: Object) -> vec4<f32> {
     return c;
 }
 
+// ChroMapper/Parametric Slice Billboard (glow sprites along lasers).
+fn shade_slice(v: VOut, o: Object) -> vec4<f32> {
+    let c = o.b[0];
+    let auv = vec2<f32>(v.uv.x / max(abs(v.uv.z), 1e-5), v.uv.y);
+    var a = v.uv.w * v.uv.w * v.uv.w * c.a;
+    if (has(o, F_ANGLE_DISAPPEAR)) {
+        a = a * v.color.x;
+    }
+    var fogf = 1.0;
+    if (has(o, F_FOG)) {
+        var hf = 1.0;
+        if (has(o, F_HEIGHT_FOG)) {
+            hf = height_factor(v.world.y, o.p[3].z, o.p[3].w);
+        }
+        fogf = hf * transmission(v.world, o.p[3].x, o.p[3].y, a);
+    }
+    if (has(o, F_USE_FOG_FOR_LIGHTS)) {
+        a = a * fogf;
+    }
+    if (has(o, F_SQUARE_ALPHA)) {
+        a = a * a;
+    }
+    let ta = textureSampleLevel(tex0, clamp_samp, auv, 0.0).a;
+    a = a * ta * ta;
+    if (!has(o, F_USE_FOG_FOR_LIGHTS)) {
+        a = a * fogf;
+    }
+    var rgb = c.rgb * a;
+    if (has(o, F_WHITEBOOST_ALWAYS)) {
+        let wb = a * a * o.p[1].z;
+        rgb = clamp(c.rgb * a + vec3<f32>(wb * wb * g.misc.y - g.misc.z), vec3<f32>(0.0), vec3<f32>(1.0));
+    }
+    return vec4<f32>(rgb, a * o.p[1].y);
+}
+
 // ChroMapper/Particles (the features environment particles use).
 fn shade_particles(v: VOut, o: Object) -> vec4<f32> {
-    var color = o.p[0];
+    // SPECTROGRAM_COLOR scales by the audio band; without audio every band is 0.
+    if (has(o, F_SPECTROGRAM_COLOR)) {
+        return vec4<f32>(0.0);
+    }
+    var color = o.b[0];
+    if (has(o, F_COLOR_ARRAY)) {
+        color = array_color(o, v.uv2);
+    }
+    color = color * o.b[6];
     if (has(o, F_VERTEX_COLOR)) {
         color = vec4<f32>(color.rgb * v.color.rgb, color.a * v.color.a);
     }
     color = vec4<f32>(color.rgb * o.p[1].y, color.a);
     var albedo = color;
-    if (has(o, F_MAIN_TEXTURE)) {
+    if (has(o, F_MAIN_TEXTURE) && has(o, F_TEXTURE_FLIPBOOK)) {
+        // Packed RGBA frames from _StartTime (raw UVs, no _MainTex_ST).
+        let fb = o.p[6];
+        let ft = (g.misc.x + o.b[5].z - o.b[5].x) * fb.w;
+        let total = trunc(fb.x * fb.y);
+        let looping = trunc(total - fb.z);
+        var frame = ft;
+        if (ft >= total) {
+            frame = fract((ft - fb.z) / looping) * looping + fb.z;
+        }
+        let cell = floor(frame);
+        let fr = fract(frame);
+        let column = cell - fb.x * floor(cell / fb.x);
+        let row = floor(cell / fb.x);
+        let uv = vec2<f32>((v.uv.x + column) / fb.x, (v.uv.y + (fb.y - 1.0 - row)) / fb.y);
+        var w: vec4<f32>;
+        if (has(o, F_FLIPBOOK_NOBLEND)) {
+            let ch = min(floor(fr * 4.0), 3.0);
+            w = vec4<f32>(select(0.0, 1.0, ch == 0.0), select(0.0, 1.0, ch == 1.0), select(0.0, 1.0, ch == 2.0), select(0.0, 1.0, ch == 3.0));
+        } else {
+            w = vec4<f32>(max(1.0 - fr * 3.0, 0.0), max(1.0 - abs(fr * 3.0 - 1.0), 0.0), max(1.0 - abs(fr * 3.0 - 2.0), 0.0), max(fr * 3.0 - 2.0, 0.0));
+        }
+        albedo.a = albedo.a * dot(textureSampleLevel(tex0, repeat_samp, uv, 0.0), w);
+    } else if (has(o, F_MAIN_TEXTURE)) {
         let st = o.p[5];
         let t = textureSampleLevel(tex0, repeat_samp, v.uv.xy * st.xy + st.zw, 0.0);
         albedo.a = albedo.a * select(t.a, t.r, has(o, F_ALPHA_RED));
@@ -398,6 +574,7 @@ fn fs_mesh(v: VOut, @builtin(front_facing) front_in: bool) -> @location(0) vec4<
         case 4u: { return shade_mirror(v, o); }
         case 5u: { return shade_spectrogram(v, o, front); }
         case 6u: { return shade_particles(v, o); }
+        case 7u: { return shade_slice(v, o); }
         default: { return shade_lit(v, o, front); }
     }
 }
