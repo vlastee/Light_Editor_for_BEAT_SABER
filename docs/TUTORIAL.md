@@ -25,6 +25,16 @@ colors, checking the result in the 3D preview and saving.
 cargo run --release -- "/path/to/Beat Saber_Data/CustomLevels/<map folder>"
 ```
 
+Or press **Browse…** in the toolbar (`Ctrl+O`). The browser lists the maps in a folder with their
+cover, song, artist, mapper, BPM and environment:
+
+- The buttons at the top jump to the song folders it found: your BSManager instances, Steam and the
+  folder of the last map.
+- Type in the search box to filter by song, artist, mapper or environment, and pick a sort order.
+- Double-click a map, or select it and press **Open** or `Enter`, to open it. When only one map
+  matches the search, `Enter` opens it. Double-click a folder to go into it, and use **⬆** to go up.
+- `Esc` closes the browser.
+
 You can also paste the path into **Map folder** and press **Load**. The last folder is remembered.
 Pick the difficulty from the dropdown next to **Load**.
 

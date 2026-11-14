@@ -223,6 +223,8 @@ pub struct App {
     motion: crate::motion::Motion,
     /// Draw the environment with the GPU renderer (else the simple one).
     use_gpu: bool,
+    /// The map browser window (Ctrl+O).
+    browser: crate::browser::MapBrowser,
 }
 
 fn last_path_file() -> Option<PathBuf> {
@@ -707,6 +709,7 @@ impl App {
             env_components: Vec::new(),
             motion: Default::default(),
             use_gpu: true,
+            browser: crate::browser::MapBrowser::new(),
             text_inputs: Vec::new(),
         };
         if !app.path_input.is_empty() {
@@ -716,6 +719,14 @@ impl App {
     }
 
     // ---- loading / saving ----
+
+    fn open_browser(&mut self) {
+        let current = self.map.as_ref().map(|m| m.folder.clone()).or_else(|| {
+            let p = PathBuf::from(self.path_input.trim());
+            (!self.path_input.trim().is_empty()).then_some(p)
+        });
+        self.browser.show(current.as_deref());
+    }
 
     fn load_folder(&mut self) {
         self.stop();
@@ -1297,6 +1308,16 @@ impl App {
         });
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
             self.save();
+        }
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::O)) {
+            self.open_browser();
+        }
+        // The browser window has the keyboard while it's open (Esc closes it).
+        if self.browser.open {
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.browser.open = false;
+            }
+            return;
         }
         if self.typing(ctx) {
             return;
@@ -2418,6 +2439,9 @@ impl App {
             if ui.button("Load").clicked() || enter {
                 self.load_folder();
             }
+            if ui.button("Browse…").on_hover_text("Find a map in your song folders (Ctrl+O)").clicked() {
+                self.open_browser();
+            }
 
             let mut pick = None;
             if let Some(m) = &self.map {
@@ -2580,5 +2604,15 @@ impl eframe::App for App {
                 egui::ScrollArea::vertical().show(ui, |ui| self.properties_ui(ui));
             });
         egui::CentralPanel::no_frame().show(ui, |ui| self.timeline_ui(ui));
+        let mut inputs = Vec::new();
+        if let Some(folder) = self.browser.ui(&ctx, &mut inputs) {
+            if self.dirty {
+                self.status = "Unsaved changes: save or revert before opening another map".into();
+            } else {
+                self.path_input = folder.display().to_string();
+                self.load_folder();
+            }
+        }
+        self.text_inputs.extend(inputs);
     }
 }

@@ -1,5 +1,6 @@
 mod app;
 mod audio;
+mod browser;
 mod check;
 mod cmlight;
 mod environment;

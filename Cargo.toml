@@ -11,3 +11,4 @@ serde_json = { version = "1.0.154", features = ["preserve_order", "float_roundtr
 bytemuck = { version = "1.25", features = ["derive"] }
 pollster = "1.0"
 png = "0.18"
+zune-jpeg = "0.5"

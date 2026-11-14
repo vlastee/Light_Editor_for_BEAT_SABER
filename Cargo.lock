@@ -530,6 +530,7 @@ dependencies = [
  "pollster",
  "rodio",
  "serde_json",
+ "zune-jpeg",
 ]
 
 [[package]]

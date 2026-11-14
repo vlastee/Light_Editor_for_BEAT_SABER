@@ -27,6 +27,7 @@ The graphics driver needs Vulkan support. Developed and tested on Linux.
 
 | Action | How |
 |---|---|
+| Open a map | **Browse…** or `Ctrl+O`: your song folders with covers and search |
 | Add keyframe | Double-click a row, or `I` to insert at the playhead on the active row |
 | Select | Click, Shift+click, or drag a box in empty space |
 | Move | Drag keys (snaps to the grid; hold Ctrl for free movement) |
