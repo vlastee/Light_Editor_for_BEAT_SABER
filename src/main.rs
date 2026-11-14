@@ -67,7 +67,10 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1600.0, 900.0])
-            .with_title("Beat Saber Light Timeline"),
+            .with_title("Beat Saber Light Timeline")
+            // Matches the desktop entry (StartupWMClass), so docks show the app's icon.
+            .with_app_id("bs-light-timeline")
+            .with_icon(std::sync::Arc::new(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon-256.png")).unwrap_or_default())),
         ..Default::default()
     };
     eframe::run_native(

@@ -23,6 +23,17 @@ The folder is the one containing `Info.dat`. The last folder is remembered.
 
 The graphics driver needs Vulkan support. Developed and tested on Linux.
 
+### AppImage
+
+```bash
+tools/build-appimage.sh
+```
+
+Writes `dist/Beat_Saber_Light_Timeline-<version>-x86_64.AppImage`. It needs `mksquashfs` and the
+AppImage type-2 runtime: pass its path, or the script copies it from an AppImage you already have in
+`~/Applications`. Copy the AppImage to `~/Applications` and add a desktop entry
+(`Exec=<path to the AppImage> %f`, `StartupWMClass=bs-light-timeline`) to get it in the app menu.
+
 ## Editing
 
 | Action | How |
